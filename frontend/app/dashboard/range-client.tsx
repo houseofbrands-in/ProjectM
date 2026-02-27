@@ -576,7 +576,7 @@ const skuRows = Array.isArray(skus)
 setTopStyles(styleRows);
 setTopSkus(skuRows);
 
-      setCohortRows(Array.isArray(cohortData?.rows) ? cohortData.rows : []);
+      setCohortRows(Array.isArray((cohortData as any)?.rows) ? (cohortData as any).rows : []);
       setActionBoard(action ?? null);
       setLastRefreshed(new Date().toLocaleString());
     } catch (e2: any) {
