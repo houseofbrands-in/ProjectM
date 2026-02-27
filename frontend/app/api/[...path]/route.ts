@@ -1,25 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
-
-// ✅ Increase body limit for large CSV uploads (Flipkart events can exceed 10MB)
-export const config = {
-  api: {
-    bodyParser: false,
-  },
-};
-
-// Next.js uses this for app route handlers to allow larger bodies
-export const maxDuration = 300; // optional, gives more time on serverless-like envs
+export const maxDuration = 300;
 
 const BACKEND =
   process.env.INTERNAL_API_URL ??
   process.env.NEXT_PUBLIC_API_URL ??
   "http://127.0.0.1:8000";
 
-async function proxy(req: NextRequest, ctx: { params: { path: string[] } }) {
-  const { path } = ctx.params;
-
+async function proxy(
+  req: NextRequest,
+  ctx: { params: Promise<{ path: string[] }> }
+) {
+  const { path } = await ctx.params;
   const incomingUrl = new URL(req.url);
   const targetUrl = new URL(`${BACKEND}/${path.join("/")}`);
   targetUrl.search = incomingUrl.search;
