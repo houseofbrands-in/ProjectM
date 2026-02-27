@@ -63,8 +63,8 @@ export async function downloadDashboardReportZip(params: {
   const [kpi, trend, topStyles, topSkus, zeroSales] = await Promise.all([
     getKpiSummary({ start, end, workspace_slug }),
     getReturnsTrend({ start, end, workspace_slug }),
-    getTopReturnStyles({ start, end, workspace_slug, mode, top_n, min_orders }),
-    getTopReturnSkus({ start, end, workspace_slug, mode, top_n, min_orders }),
+    getTopReturnStyles({ start, end, workspace_slug, return_mode: mode, top_n, min_orders } as any),
+    getTopReturnSkus({ start, end, workspace_slug, return_mode: mode, top_n, min_orders } as any),
     getZeroSalesSinceLive({ workspace_slug, min_days_live: zero_min_days_live, top_n: zero_top_n }),
   ]);
 
