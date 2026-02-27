@@ -72,7 +72,7 @@ export default function WorkspaceBar() {
         <select
           className="h-9 rounded-xl border bg-background px-3 text-sm"
           value={portal}
-          onChange={(e) => setPortal(e.target.value)}
+          onChange={(e) => setPortal(e.target.value as any)}
         >
           {PORTALS.map((p) => (
             <option key={p.value} value={p.value}>
