@@ -292,6 +292,99 @@ export async function getGmvAsp(
   );
 }
 
+// =====================
+// ASP Optimizer (Pricing Insights)
+// =====================
+export type AspOptimizerBand = {
+  from: number;
+  to: number;
+  mid: number;
+};
+
+export type AspOptimizerBucket = {
+  band: AspOptimizerBand;
+  sold_units: number;
+  gmv: number;
+  days: number;
+  avg_units_per_day: number;
+
+  returns_total: number;
+  returns_rto: number;
+  returns_customer: number;
+  returns_pct: number;
+
+  net_units: number;
+  avg_net_units_per_day: number;
+};
+
+export type AspOptimizerRow = {
+  key: string; // style_key / sku / brand (depending on level)
+  current_asp: number;
+  days_active: number;
+  units: number;
+  confidence: "high" | "medium" | "low";
+  current_avg_units_per_day: number;
+
+  best_volume_band: AspOptimizerBucket | null;
+  best_net_band: AspOptimizerBucket | null;
+
+  lift_units_pct: number | null;
+};
+
+export type AspOptimizerTimeseriesPoint = {
+  date: string; // YYYY-MM-DD
+  units: number;
+  gmv: number;
+  asp: number | null;
+  returns_units: number;
+};
+
+export type AspOptimizerResp = {
+  portal: string | null;
+  level: "brand" | "style" | "sku";
+  start: string;
+  end: string;
+  bucket_size: number;
+  rows: AspOptimizerRow[];
+  deep_dive: null | {
+    timeseries: AspOptimizerTimeseriesPoint[];
+  };
+  note?: string;
+};
+
+export async function getAspOptimizer(args: {
+  start: string;
+  end: string;
+  workspace_slug?: string;
+  portal?: string;
+  brand?: string;
+
+  level?: "brand" | "style" | "sku";
+  key?: string;
+
+  bucket_size?: number;
+  top_n?: number;
+  min_days?: number;
+  min_units?: number;
+}): Promise<AspOptimizerResp> {
+  const workspace_slug = args.workspace_slug ?? DEFAULT_WS;
+  return apiGet<AspOptimizerResp>("/db/kpi/asp-optimizer", {
+    start: args.start,
+    end: args.end,
+    workspace_slug,
+    portal: args.portal,
+    brand: args.brand,
+    level: args.level ?? "style",
+    key: args.key,
+    bucket_size: args.bucket_size ?? 50,
+    top_n: args.top_n ?? 50,
+    min_days: args.min_days ?? 7,
+    min_units: args.min_units ?? 10,
+  });
+}
+
+
+
 
 export type BrandGmvAspRow = {
   brand: string;
@@ -919,6 +1012,34 @@ export async function uploadFlipkartTraffic(
   return data as IngestResult;
 }
 
+export async function uploadFlipkartGstrSales({
+  file,
+  replace,
+  workspace_slug,
+}: {
+  file: File;
+  replace: boolean;
+  workspace_slug: string;
+}) {
+  const form = new FormData();
+  form.append("file", file);
+
+  const qs = new URLSearchParams();
+  qs.set("workspace_slug", workspace_slug || "default");
+  qs.set("replace", String(!!replace));
+
+  const res = await fetch(`/api/db/ingest/flipkart-gstr-sales?${qs.toString()}`, {
+    method: "POST",
+    body: form,
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(txt || `Upload failed (${res.status})`);
+  }
+
+  return res.json();
+}
 
 
 export type TopReturnSkuRow = {
@@ -1086,13 +1207,14 @@ export type HouseMonthlyResponse = {
   rows: HouseMonthlyRow[];
 };
 
-export async function getHouseSummary(params?: { start?: string; end?: string }) {
+export async function getHouseSummary(params?: { start?: string; end?: string; portal?: "all" | "myntra" | "flipkart" }) {
   return apiGet<HouseSummaryResponse>("/db/kpi/house-summary", params ?? {});
 }
 
-export async function getHouseMonthly(params?: { months?: number }) {
+export async function getHouseMonthly(params?: { months?: number; portal?: "all" | "myntra" | "flipkart" }) {
   return apiGet<HouseMonthlyResponse>("/db/kpi/house-monthly", params ?? {});
 }
+
 
 
 

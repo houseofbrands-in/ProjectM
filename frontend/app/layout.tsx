@@ -51,8 +51,12 @@ export default function RootLayout({
               Ad Recommendations
             </Link>
             <Link className="rounded-xl px-3 py-2 hover:bg-muted" href="/forecast">
-  Forecast
-</Link>
+              Forecast
+            </Link>
+            <Link className="rounded-xl px-3 py-2 hover:bg-muted" href="/asp-optimizer">
+              ASP Optimizer
+            </Link>
+
 
           </nav>
         </div>

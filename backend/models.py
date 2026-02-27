@@ -215,3 +215,31 @@ class FlipkartTrafficRaw(Base):
     raw_json = Column(Text, nullable=True)
 
     ingested_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+class FlipkartGstrSalesRaw(Base):
+    __tablename__ = "flipkart_gstr_sales_raw"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+
+    # keys
+    order_id = Column(Text, nullable=True, index=True)
+    order_item_id = Column(Text, nullable=True, index=True)
+    seller_sku_code = Column(Text, nullable=True, index=True)  # SKU in GSTR (Flipkart: acts as Style+SKU)
+
+    # dates (we use Order Date as timeline)
+    order_date = Column(Date, nullable=True, index=True)
+    buyer_invoice_date = Column(Date, nullable=True, index=True)
+
+    # qty + amount
+    item_quantity = Column(Integer, nullable=True)
+    buyer_invoice_amount = Column(Float, nullable=True)  # Buyer Invoice Amount (can be negative)
+
+    # event info
+    event_type = Column(Text, nullable=True, index=True)
+    event_sub_type = Column(Text, nullable=True, index=True)
+
+    product_title = Column(Text, nullable=True)
+
+    raw_json = Column(Text, nullable=True)
+
+    ingested_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)

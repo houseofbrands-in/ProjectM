@@ -1,4 +1,3 @@
-// frontend/app/uploads/page.tsx
 "use client";
 
 import * as React from "react";
@@ -17,10 +16,11 @@ import {
   uploadFlipkartReturns,
   uploadFlipkartListing,
   uploadFlipkartTraffic,
+  uploadFlipkartGstrSales,
   type IngestResult,
 } from "@/lib/api";
 
-type UploadKind = "sales" | "returns" | "catalog" | "stock" | "flipkart_traffic";
+type UploadKind = "sales" | "returns" | "catalog" | "stock" | "flipkart_traffic" | "flipkart_gstr";
 
 type UploadState = {
   selected?: string | null;
@@ -41,6 +41,7 @@ export default function UploadsPage() {
     catalog: { replace: false },
     stock: { replace: false },
     flipkart_traffic: { replace: false },
+    flipkart_gstr: { replace: false },
   });
 
   function setReplace(kind: UploadKind, value: boolean) {
@@ -141,6 +142,29 @@ export default function UploadsPage() {
           return;
         }
 
+        if (kind === "flipkart_gstr") {
+          const res: any = await uploadFlipkartGstrSales({
+            file,
+            replace,
+            workspace_slug: workspaceSlug,
+          });
+
+          const inserted = Number(res?.inserted ?? 0);
+          const deleted = Number(res?.deleted ?? 0);
+
+          setState((prev) => ({
+            ...prev,
+            [kind]: { ...prev[kind], loading: false, lastUploadAt: new Date().toLocaleString(), inserted, error: null },
+          }));
+
+          toast.success("FLIPKART GSTR uploaded", {
+            description: `Workspace: ${workspaceSlug} • Inserted: ${inserted} • Deleted: ${deleted} • Replace: ${
+              replace ? "YES" : "NO"
+            }`,
+          });
+          return;
+        }
+
         if (kind === "stock") {
           throw new Error("Flipkart mode: stock comes via Listing upload (Catalog+Stock).");
         }
@@ -160,8 +184,7 @@ export default function UploadsPage() {
       } else if (kind === "stock") {
         r = await uploadStock({ file, replace, workspace_slug: workspaceSlug });
       } else {
-        // traffic upload is only for flipkart
-        throw new Error("Flipkart Traffic upload is only available when portal=flipkart.");
+        throw new Error("This upload type is only available for Flipkart.");
       }
 
       setState((prev) => ({
@@ -247,11 +270,24 @@ export default function UploadsPage() {
               onReplaceChange={setReplace}
             />
           )}
+
+          {isFlipkart ? (
+            <UploadCard
+              kind="flipkart_gstr"
+              title="Flipkart GSTR Sales Upload"
+              hint="GSTR → flipkart_gstr_sales_raw (Buyer Invoice Amount)"
+              accept=".xlsx,.xls"
+              data={state.flipkart_gstr}
+              onUpload={handleUpload}
+              onReplaceChange={setReplace}
+            />
+          ) : null}
         </div>
 
         {isFlipkart ? (
           <div className="text-xs text-muted-foreground">
-            Flipkart mode: upload <b>Orders</b>, <b>Returns</b>, <b>Listing</b> (Catalog+Stock), and <b>Traffic</b>.
+            Flipkart mode: upload <b>Orders</b>, <b>Returns</b>, <b>Listing</b> (Catalog+Stock), <b>Traffic</b>, and{" "}
+            <b>GSTR</b> (amount/GMV).
           </div>
         ) : null}
       </div>
@@ -303,11 +339,7 @@ function UploadCard({
         />
 
         <label className="flex items-center gap-2 text-xs select-none">
-          <input
-            type="checkbox"
-            checked={!!data.replace}
-            onChange={(e) => onReplaceChange(kind, e.target.checked)}
-          />
+          <input type="checkbox" checked={!!data.replace} onChange={(e) => onReplaceChange(kind, e.target.checked)} />
           Replace existing data for this workspace
         </label>
 

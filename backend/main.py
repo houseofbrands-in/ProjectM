@@ -36,7 +36,8 @@ from sqlalchemy import cast, Numeric
 from sqlalchemy.dialects.postgresql import JSONB
 
 from backend.db import SessionLocal, Base, engine
-from backend.models import CatalogRaw, ReturnsRaw, SalesRaw, Workspace, MyntraWeeklyPerfRaw, StockRaw
+from backend.models import CatalogRaw, ReturnsRaw, SalesRaw, Workspace, MyntraWeeklyPerfRaw, StockRaw, FlipkartGstrSalesRaw
+
 # ensure tables exist (simple dev-mode migration)
 Base.metadata.create_all(bind=engine)
 
@@ -46,9 +47,15 @@ from backend.models import CatalogRaw
 from sqlalchemy.dialects.postgresql import insert
 
 from pydantic import BaseModel, Field
-from backend.models import FlipkartTrafficRaw
+from backend.models import FlipkartTrafficRaw, FlipkartGstrSalesRaw
 
 from dateutil.relativedelta import relativedelta
+import csv
+import io
+import json
+from datetime import datetime, date, time, timedelta
+from fastapi import UploadFile, File, Query
+
 
 from sqlalchemy import cast
 from sqlalchemy.dialects.postgresql import JSONB
@@ -296,19 +303,37 @@ def _fk_prefix(ws_slug: str) -> str:
 
 def _apply_portal_sales(q, ws_slug: str, portal: str | None):
     p = _portal_norm(portal)
+
+    fk_match = or_(
+        SalesRaw.order_line_id.like("fk:%"),
+        func.lower(func.trim(func.coalesce(SalesRaw.style_key, ""))).like("fk:%"),
+        func.lower(func.trim(func.coalesce(SalesRaw.seller_sku_code, ""))).like("fk:%"),
+    )
+
     if p == "flipkart":
-        return q.filter(SalesRaw.order_line_id.like("fk:%"))
+        return q.filter(fk_match)
+
     if p == "myntra":
-        return q.filter(sqlalchemy.not_(SalesRaw.order_line_id.like("fk:%")))
+        return q.filter(sqlalchemy.not_(fk_match))
+
     return q
 
 
 def _apply_portal_returns(q, ws_slug: str, portal: str | None):
     p = _portal_norm(portal)
+
+    fk_match = or_(
+        ReturnsRaw.order_line_id.like("fk:%"),
+        func.lower(func.trim(func.coalesce(ReturnsRaw.style_key, ""))).like("fk:%"),
+        func.lower(func.trim(func.coalesce(ReturnsRaw.seller_sku_code, ""))).like("fk:%"),
+    )
+
     if p == "flipkart":
-        return q.filter(ReturnsRaw.order_line_id.like("fk:%"))
+        return q.filter(fk_match)
+
     if p == "myntra":
-        return q.filter(sqlalchemy.not_(ReturnsRaw.order_line_id.like("fk:%")))
+        return q.filter(sqlalchemy.not_(fk_match))
+
     return q
 
 
@@ -1138,25 +1163,47 @@ def db_kpi_house_gmv(
 def db_kpi_house_summary(
     start: date | None = Query(None, description="YYYY-MM-DD (optional). If provided, end required."),
     end: date | None = Query(None, description="YYYY-MM-DD (optional). If provided, start required."),
+    portal: str | None = Query(None, description="all | myntra | flipkart"),
 ):
     """
     House Summary across ALL workspaces.
     - If start/end not provided => all-time
     - If start/end provided => date range (inclusive)
-    GMV uses Seller Price (sellerprice) from SalesRaw.raw_json * units
+    GMV:
+      - Myntra => sellerprice * units from SalesRaw.raw_json
+      - Flipkart => from FlipkartGstrSalesRaw.buyer_invoice_amount
     Returns units from ReturnsRaw.units (fallback 1)
-    Return split: RTO vs CUSTOMER (everything not RTO treated as CUSTOMER)
+    Return split: RTO vs CUSTOMER_RETURN (everything not RTO treated as CUSTOMER)
+    Portal filtering is via order_line_id prefix: "fk:%"
     """
     db = SessionLocal()
     try:
         if (start is None) != (end is None):
             raise HTTPException(status_code=400, detail="Provide both start and end, or neither.")
 
+        # portal normalized (must exist for both all-time and range mode)
+        p = _portal_norm(portal)  # "myntra" | "flipkart" | None (all)
+
         start_dt = None
         end_dt_excl = None
         if start and end:
             start_dt = datetime.combine(start, time.min)
             end_dt_excl = datetime.combine(end + timedelta(days=1), time.min)
+
+        # Portal filter helpers (do NOT rely on closure variables)
+        def apply_sales_portal_filter(q, pval: str | None):
+            if pval == "flipkart":
+                return q.filter(SalesRaw.order_line_id.like("fk:%"))
+            if pval == "myntra":
+                return q.filter(~SalesRaw.order_line_id.like("fk:%"))
+            return q  # all
+
+        def apply_returns_portal_filter(q, pval: str | None):
+            if pval == "flipkart":
+                return q.filter(ReturnsRaw.order_line_id.like("fk:%"))
+            if pval == "myntra":
+                return q.filter(~ReturnsRaw.order_line_id.like("fk:%"))
+            return q  # all
 
         def to_float(x):
             try:
@@ -1178,10 +1225,12 @@ def db_kpi_house_summary(
         # -----------------------
         sales_agg: dict[str, dict] = {}
 
-        sq = (
+        sq = apply_sales_portal_filter(
             db.query(SalesRaw.workspace_id, SalesRaw.units, SalesRaw.raw_json, SalesRaw.order_date)
-            .filter(SalesRaw.order_date.isnot(None))
+            .filter(SalesRaw.order_date.isnot(None)),
+            p,
         )
+
         if start_dt and end_dt_excl:
             sq = sq.filter(SalesRaw.order_date >= start_dt).filter(SalesRaw.order_date < end_dt_excl)
 
@@ -1189,31 +1238,57 @@ def db_kpi_house_summary(
             ws_key = str(ws_id)
             u = int(units or 1)
 
-            raw = {}
-            v = raw_json
-            if isinstance(v, dict):
-                raw = v
-            elif isinstance(v, str) and v.strip():
-                try:
-                    raw = json.loads(v)
-                except Exception:
-                    raw = {}
-                if not isinstance(raw, dict):
-                    raw = {}
-            else:
-                raw = {}
-
-            price_val = pick_by_norm(raw, "sellerprice")
-            price = to_float(price_val) or 0.0
-            gmv = price * u
-
             rec = sales_agg.get(ws_key)
             if not rec:
                 rec = {"orders": 0, "gmv": 0.0}
                 sales_agg[ws_key] = rec
 
             rec["orders"] += u
-            rec["gmv"] += gmv
+
+            # Myntra GMV from sellerprice; Flipkart GMV comes from GSTR below
+            if p != "flipkart":
+                raw = {}
+                v = raw_json
+                if isinstance(v, dict):
+                    raw = v
+                elif isinstance(v, str) and v.strip():
+                    try:
+                        raw = json.loads(v)
+                    except Exception:
+                        raw = {}
+                    if not isinstance(raw, dict):
+                        raw = {}
+                else:
+                    raw = {}
+
+                price_val = pick_by_norm(raw, "sellerprice")
+                price = to_float(price_val) or 0.0
+                rec["gmv"] += price * u
+
+        # -----------------------
+        # FLIPKART GMV (GSTR) aggregation (workspace-wise)
+        # -----------------------
+        if p in (None, "flipkart"):
+            gq = (
+                db.query(
+                    FlipkartGstrSalesRaw.workspace_id.label("ws_id"),
+                    func.coalesce(func.sum(FlipkartGstrSalesRaw.buyer_invoice_amount), 0.0).label("gmv"),
+                )
+                .filter(FlipkartGstrSalesRaw.order_date.isnot(None))
+            )
+            if start and end:
+                # FlipkartGstrSalesRaw.order_date is Date
+                gq = gq.filter(FlipkartGstrSalesRaw.order_date >= start).filter(FlipkartGstrSalesRaw.order_date <= end)
+
+            gq = gq.group_by(FlipkartGstrSalesRaw.workspace_id).all()
+
+            for r in gq:
+                ws_key = str(r.ws_id)
+                rec = sales_agg.get(ws_key)
+                if not rec:
+                    rec = {"orders": 0, "gmv": 0.0}
+                    sales_agg[ws_key] = rec
+                rec["gmv"] += float(r.gmv or 0.0)
 
         # -----------------------
         # RETURNS aggregation (workspace-wise)
@@ -1222,14 +1297,16 @@ def db_kpi_house_summary(
         unit_expr = func.coalesce(ReturnsRaw.units, 1)
         rto_flag = func.upper(func.trim(func.coalesce(ReturnsRaw.return_type, ""))) == "RTO"
 
-        rq = (
+        rq = apply_returns_portal_filter(
             db.query(
                 ReturnsRaw.workspace_id.label("ws_id"),
                 func.coalesce(func.sum(unit_expr), 0).label("total_units"),
                 func.coalesce(func.sum(case((rto_flag, unit_expr), else_=0)), 0).label("rto_units"),
             )
-            .filter(ReturnsRaw.return_date.isnot(None))
+            .filter(ReturnsRaw.return_date.isnot(None)),
+            p,
         )
+
         if start_dt and end_dt_excl:
             rq = rq.filter(ReturnsRaw.return_date >= start_dt).filter(ReturnsRaw.return_date < end_dt_excl)
 
@@ -1296,7 +1373,9 @@ def db_kpi_house_summary(
 @app.get("/db/kpi/house-monthly")
 def db_kpi_house_monthly(
     months: int = Query(12, ge=1, le=36, description="How many recent months to return"),
+    portal: str | None = Query(None, description="all | myntra | flipkart"),
 ):
+
     """
     Last N months totals across ALL workspaces:
     GMV + Orders + Returns split (RTO vs Customer)
@@ -1318,6 +1397,8 @@ def db_kpi_house_monthly(
         y0, m0 = today.year, today.month
         y_start, m_start = shift_month(y0, m0, -(months - 1))
         start_dt = datetime(y_start, m_start, 1, 0, 0, 0)
+        p = _portal_norm(portal)
+        start_date = start_dt.date()
 
         def to_float(x):
             try:
@@ -1338,11 +1419,16 @@ def db_kpi_house_monthly(
 
         # SALES (loop, consistent with your GMV logic)
         sq = (
-            db.query(SalesRaw.units, SalesRaw.raw_json, SalesRaw.order_date)
+            db.query(SalesRaw.units, SalesRaw.raw_json, SalesRaw.order_date, SalesRaw.order_line_id)
             .filter(SalesRaw.order_date.isnot(None))
             .filter(SalesRaw.order_date >= start_dt)
         )
-        for units, raw_json, od in sq.yield_per(5000):
+        if p == "flipkart":
+            sq = sq.filter(SalesRaw.order_line_id.like("fk:%"))
+        elif p == "myntra":
+            sq = sq.filter(~SalesRaw.order_line_id.like("fk:%"))
+
+        for units, raw_json, od, _olid in sq.yield_per(5000):
             if not od:
                 continue
             mk = month_key(od)
@@ -1368,11 +1454,35 @@ def db_kpi_house_monthly(
             else:
                 raw = {}
 
-            price_val = pick_by_norm(raw, "sellerprice")
-            price = to_float(price_val) or 0.0
-
             rec["orders"] += u
-            rec["gmv"] += price * u
+
+            # Myntra GMV from sellerprice; Flipkart GMV comes from GSTR (added below)
+            if p != "flipkart":
+                price_val = pick_by_norm(raw, "sellerprice")
+                price = to_float(price_val) or 0.0
+                rec["gmv"] += price * u
+
+        # FLIPKART GMV monthly from GSTR
+        if p in (None, "flipkart"):
+            g_month = func.to_char(FlipkartGstrSalesRaw.order_date, "YYYY-MM")
+            gq = (
+                db.query(
+                    g_month.label("month_key"),
+                    func.coalesce(func.sum(FlipkartGstrSalesRaw.buyer_invoice_amount), 0.0).label("gmv"),
+                )
+                .filter(FlipkartGstrSalesRaw.order_date.isnot(None))
+                .filter(FlipkartGstrSalesRaw.order_date >= start_date)
+                .group_by(g_month)
+                .all()
+            )
+            for r in gq:
+                mk = str(r.month_key)
+                rec = agg.get(mk)
+                if not rec:
+                    rec = {"orders": 0, "gmv": 0.0, "returns_total": 0, "returns_rto": 0, "returns_customer": 0}
+                    agg[mk] = rec
+                rec["gmv"] += float(r.gmv or 0.0)
+
 
         # RETURNS (SQL aggregate)
         unit_expr = func.coalesce(ReturnsRaw.units, 1)
@@ -1387,9 +1497,14 @@ def db_kpi_house_monthly(
             )
             .filter(ReturnsRaw.return_date.isnot(None))
             .filter(ReturnsRaw.return_date >= start_dt)
-            .group_by(month_expr)
-            .all()
         )
+        if p == "flipkart":
+            rq = rq.filter(ReturnsRaw.order_line_id.like("fk:%"))
+        elif p == "myntra":
+            rq = rq.filter(~ReturnsRaw.order_line_id.like("fk:%"))
+
+        rq = rq.group_by(month_expr).all()
+
 
         for r in rq:
             mk = str(r.month_key)
@@ -1433,7 +1548,7 @@ def db_kpi_brand_gmv_asp(
     end: date = Query(...),
     workspace_slug: str | None = Query(None),
     workspace: str = Query("default"),  # backward compat
-    brand: str | None = Query(None, description="Optional brand filter (catalog_raw.brand)"),
+    brand: str | None = Query(None),
     top_n: int = Query(50, ge=1, le=500),
     portal: str | None = Query(None),
 ):
@@ -1442,182 +1557,173 @@ def db_kpi_brand_gmv_asp(
         ws_slug = (workspace_slug or "").strip() or (workspace or "default")
         ws_id = resolve_workspace_id(db, ws_slug)
 
+        p = _portal_norm(portal)
+
+        # ✅ Flipkart: no brand available => return only ALL using GSTR NET
+        if p == "flipkart":
+            # ignore brand filter safely
+            row = (
+                db.query(
+                    func.coalesce(func.sum(FlipkartGstrSalesRaw.buyer_invoice_amount), 0.0).label("gmv"),
+                    func.coalesce(func.sum(FlipkartGstrSalesRaw.item_quantity), 0).label("units"),
+                    func.count(FlipkartGstrSalesRaw.id).label("orders"),
+                )
+                .filter(FlipkartGstrSalesRaw.workspace_id == ws_id)
+                .filter(FlipkartGstrSalesRaw.order_date.isnot(None))
+                .filter(FlipkartGstrSalesRaw.order_date >= start)
+                .filter(FlipkartGstrSalesRaw.order_date <= end)
+                .one()
+            )
+
+            gmv = float(row.gmv or 0.0)
+            units = int(row.units or 0)
+            orders = int(row.orders or 0)
+            asp = (gmv / units) if units > 0 else 0.0
+
+            return {
+                "workspace_slug": ws_slug,
+                "window": {"start": str(start), "end": str(end)},
+                "total_gmv": round(gmv, 2),
+                "total_orders": orders,
+                "rows": [
+                    {
+                        "brand": "(All)",
+                        "orders": units,  # units is more meaningful than row count
+                        "gmv": round(gmv, 2),
+                        "asp": round(asp, 2),
+                        "share_pct": 100.0,
+                    }
+                ],
+                "note": "Flipkart has no brand dimension in ingested data; showing overall (All) using GSTR NET Buyer Invoice Amount.",
+            }
+
+        # -----------------------------
+        # Myntra / others: keep existing SalesRaw logic
+        # -----------------------------
         start_dt = datetime.combine(start, time.min)
         end_dt_excl = datetime.combine(end + timedelta(days=1), time.min)
 
-        # -----------------------
-        # Helpers
-        # -----------------------
         def _norm(s: str) -> str:
-            return "".join(ch for ch in str(s).strip().lower() if ch.isalnum())
-
-        def pick_by_norm(d: dict, desired_norm: str):
-            for k, v in (d or {}).items():
-                if _norm(k) == desired_norm:
-                    return v
-            return None
+            return "".join(ch for ch in str(s or "").strip().lower() if ch.isalnum())
 
         def to_float(x):
             try:
                 s = str(x).replace(",", "").strip()
                 if not s or s.lower() == "nan":
-                    return None
+                    return 0.0
                 return float(s)
             except Exception:
-                return None
+                return 0.0
 
-        def parse_raw_json(v):
-            """
-            Supports:
-            - dict (already parsed)
-            - JSON string
-            - python-dict-like string using single quotes
-            """
-            if isinstance(v, dict):
-                return v
-            if isinstance(v, str) and v.strip():
-                try:
-                    return json.loads(v)
-                except Exception:
-                    try:
-                        obj = ast.literal_eval(v) if v.strip().startswith("{") else {}
-                        return obj if isinstance(obj, dict) else {}
-                    except Exception:
-                        return {}
-            return {}
+        # seller price from raw_json (try common keys)
+        sellerprice_txt = cast(SalesRaw.raw_json, JSONB).op("->>")("sellerprice")
+        seller_price_txt = cast(SalesRaw.raw_json, JSONB).op("->>")("seller price")
+        sellingprice_txt = cast(SalesRaw.raw_json, JSONB).op("->>")("sellingprice")
 
-        # -----------------------
-        # Optional brand filter via CatalogRaw.brand -> style_keys
-        # -----------------------
-        brand_norm = (brand or "").strip().lower() if brand else None
+        seller_price_num = cast(
+            func.nullif(
+                func.trim(
+                    func.replace(
+                        func.coalesce(sellerprice_txt, seller_price_txt, sellingprice_txt),
+                        ",",
+                        "",
+                    )
+                ),
+                "",
+            ),
+            Numeric,
+        )
+
+        # Brand mapping from catalog (style_key -> brand)
+        style_to_brand = {}
+        cat_q = (
+            db.query(CatalogRaw.style_key, CatalogRaw.brand)
+            .filter(CatalogRaw.workspace_id == ws_id)
+        )
+        cat_q = _apply_portal_catalog(cat_q, p)
+
+        for sk, br in cat_q.all():
+            if sk is None:
+                continue
+            style_to_brand[str(sk)] = (br or "").strip() or "(Unknown)"
+
         style_key_filter = None
+        if brand:
+            bnorm = _norm(brand)
+            allowed = [sk for sk, br in style_to_brand.items() if _norm(br) == bnorm]
+            style_key_filter = set(allowed)
+            if len(style_key_filter) == 0:
+                return {
+                    "workspace_slug": ws_slug,
+                    "window": {"start": str(start), "end": str(end)},
+                    "total_gmv": 0.0,
+                    "total_orders": 0,
+                    "rows": [],
+                }
 
-        if brand_norm:
-            brand_style_keys_sq = (
-                db.query(func.lower(func.trim(CatalogRaw.style_key)).label("style_key"))
-                .filter(
-                    CatalogRaw.workspace_id == ws_id,
-                    CatalogRaw.style_key.isnot(None),
-                    CatalogRaw.brand.isnot(None),
-                    func.lower(func.trim(CatalogRaw.brand)) == brand_norm,
-                )
-                .distinct()
-                .subquery()
+        q = (
+            db.query(
+                SalesRaw.style_key,
+                SalesRaw.units,
+                seller_price_num.label("price"),
             )
-            style_key_filter = select(brand_style_keys_sq.c.style_key)
-
-        # -----------------------
-        # Pull sales rows in window
-        # -----------------------
-        sales_q = (
-            db.query(SalesRaw.style_key, SalesRaw.units, SalesRaw.raw_json)
             .filter(SalesRaw.workspace_id == ws_id)
             .filter(SalesRaw.order_date >= start_dt)
             .filter(SalesRaw.order_date < end_dt_excl)
         )
-        sales_q = _apply_portal_sales(sales_q, ws_slug, portal)
+        q = _apply_portal_sales(q, ws_slug, p)
 
         if style_key_filter is not None:
-            sales_q = sales_q.filter(func.lower(func.trim(SalesRaw.style_key)).in_(style_key_filter))
+            q = q.filter(SalesRaw.style_key.in_(list(style_key_filter)))
 
-        sales_rows = sales_q.all()
-
-        # -----------------------
-        # style_key -> brand map from catalog (preferred)
-        # -----------------------
-        style_keys = sorted(
-            {
-                str(r.style_key).strip().lower()
-                for r in sales_rows
-                if r.style_key and str(r.style_key).strip()
-            }
-        )
-
-        brand_map: dict[str, str] = {}
-        if style_keys:
-            CHUNK = 1000
-            for i in range(0, len(style_keys), CHUNK):
-                chunk = style_keys[i : i + CHUNK]
-                cat_rows = (
-                    db.query(
-                        func.lower(func.trim(CatalogRaw.style_key)).label("style_key"),
-                        func.max(CatalogRaw.brand).label("brand"),
-                    )
-                    .filter(CatalogRaw.workspace_id == ws_id)
-                    .filter(CatalogRaw.style_key.isnot(None))
-                    .filter(func.lower(func.trim(CatalogRaw.style_key)).in_(chunk))
-                    .group_by(func.lower(func.trim(CatalogRaw.style_key)))
-                    .all()
-                )
-                for c in cat_rows:
-                    if c.style_key and c.brand:
-                        brand_map[str(c.style_key)] = str(c.brand).strip()
-
-        # -----------------------
-        # Aggregate per brand
-        # -----------------------
-        agg: dict[str, dict] = {}
+        by_brand = {}
+        total_units = 0
         total_gmv = 0.0
-        total_orders = 0
 
-        for r in sales_rows:
-            units = int(r.units or 1)
-            style_norm = str(r.style_key).strip().lower() if r.style_key else ""
+        for sk, units, price in q.yield_per(5000):
+            u = int(units or 0)
+            if u <= 0:
+                continue
+            pr = float(price or 0.0)
+            gmv = pr * u
 
-            raw = parse_raw_json(r.raw_json)
+            bname = style_to_brand.get(str(sk), "(Unknown)")
 
-            # Brand: catalog first, fallback to raw_json['brand']
-            b = brand_map.get(style_norm)
-            if not b:
-                b2 = pick_by_norm(raw, "brand")
-                b = str(b2).strip() if b2 not in (None, "") else "(Unknown)"
+            rec = by_brand.get(bname)
+            if rec is None:
+                rec = {"orders": 0, "gmv": 0.0}
+                by_brand[bname] = rec
 
-            # GMV uses Seller Price
-            price_val = pick_by_norm(raw, "sellerprice")
-            price = to_float(price_val) or 0.0
-
-            gmv = price * units
-            total_gmv += gmv
-            total_orders += units
-
-            rec = agg.get(b)
-            if not rec:
-                rec = {"brand": b, "orders": 0, "gmv": 0.0}
-                agg[b] = rec
-
-            rec["orders"] += units
+            rec["orders"] += u
             rec["gmv"] += gmv
 
-        rows = []
-        for b, rec in agg.items():
-            orders = int(rec["orders"] or 0)
-            gmv = float(rec["gmv"] or 0.0)
-            asp = (gmv / orders) if orders > 0 else 0.0
-            share_pct = (gmv / total_gmv * 100.0) if total_gmv > 0 else 0.0
+            total_units += u
+            total_gmv += gmv
 
+        rows = []
+        for bname, rec in by_brand.items():
+            units = int(rec["orders"] or 0)
+            gmv = float(rec["gmv"] or 0.0)
+            asp = (gmv / units) if units > 0 else 0.0
+            share = (units / total_units * 100.0) if total_units > 0 else 0.0
             rows.append(
-                {
-                    "brand": b,
-                    "orders": orders,
-                    "gmv": round(gmv, 2),
-                    "asp": round(asp, 2),
-                    "share_pct": round(share_pct, 2),
-                }
+                {"brand": bname, "orders": units, "gmv": round(gmv, 2), "asp": round(asp, 2), "share_pct": round(share, 2)}
             )
 
-        # Default sort: GMV desc + apply top_n
-        rows.sort(key=lambda x: x["gmv"], reverse=True)
+        rows.sort(key=lambda r: float(r.get("gmv") or 0.0), reverse=True)
         rows = rows[: int(top_n)]
 
         return {
             "workspace_slug": ws_slug,
             "window": {"start": str(start), "end": str(end)},
-            "total_gmv": round(total_gmv, 2),
-            "total_orders": int(total_orders),
+            "total_gmv": round(float(total_gmv), 2),
+            "total_orders": int(total_units),
             "rows": rows,
         }
+
     finally:
         db.close()
+
 
 @app.get("/db/kpi/style-gmv-asp")
 def db_kpi_style_gmv_asp(
@@ -2126,6 +2232,535 @@ def db_returns_summary(
         db.close()
 
 
+@app.get("/db/kpi/asp-optimizer")
+def db_kpi_asp_optimizer(
+    start: date = Query(...),
+    end: date = Query(...),
+    workspace_slug: str | None = Query(None),
+    workspace: str = Query("default"),  # backward compat
+    portal: str | None = Query(None),
+    brand: str | None = Query(None, description="Optional brand filter (catalog_raw.brand)"),
+    level: str = Query("style", description="Aggregation level: brand|style|sku"),
+    key: str | None = Query(None, description="Optional deep-dive key (brand name, style_key, or seller_sku_code)"),
+    bucket_size: int = Query(50, ge=1, le=1000, description="Price bucket size (₹). Example: 50 => ₹0-49, ₹50-99..."),
+    top_n: int = Query(50, ge=1, le=500),
+    min_days: int = Query(7, ge=1, le=365),
+    min_units: int = Query(10, ge=0, le=10_000_000),
+):
+    """
+    ASP Optimizer / Pricing Insights (MVP)
+    - Myntra: Uses SalesRaw.raw_json['sellerprice'] (fallback: sellingprice/unitprice/price)
+    - Flipkart: Uses FlipkartTrafficRaw (revenue / sales_qty) because orders sheet may not have price
+    - Buckets ASP into ranges (bucket_size)
+    - Finds which ASP bucket yields best avg units/day, and also considers returns impact (when available)
+    - Supports portal + brand filters and level aggregation (brand/style/sku)
+    - Optional deep-dive for a single key (style_key or seller_sku_code)
+    """
+    db = SessionLocal()
+    try:
+        ws_slug = (workspace_slug or "").strip() or (workspace or "default")
+        ws_id = resolve_workspace_id(db, ws_slug)
+
+        p = _portal_norm(portal)
+        lvl = (level or "style").strip().lower()
+        if lvl not in ("brand", "style", "sku"):
+            lvl = "style"
+
+        # Flipkart does not have a real style_id in your system:
+        # seller_sku is considered as both StyleKey and SKU for this feature.
+        if p == "flipkart" and lvl in ("style", "sku"):
+            lvl = "sku"
+
+        start_dt = datetime.combine(start, time.min)
+        end_dt_excl = datetime.combine(end + timedelta(days=1), time.min)
+
+        # -----------------------
+        # Helpers (local, no assumptions)
+        # -----------------------
+        def _norm(s: str) -> str:
+            return "".join(ch for ch in str(s or "").strip().lower() if ch.isalnum())
+
+        def parse_raw(raw_json):
+            if raw_json is None:
+                return {}
+            if isinstance(raw_json, dict):
+                return raw_json
+            s = str(raw_json).strip()
+            if not s:
+                return {}
+            try:
+                return json.loads(s)
+            except Exception:
+                try:
+                    return ast.literal_eval(s)
+                except Exception:
+                    return {}
+
+        def pick_by_norm(d: dict, desired_norm: str):
+            for k, v in (d or {}).items():
+                if _norm(k) == desired_norm:
+                    return v
+            return None
+
+        def to_float(x):
+            try:
+                s = str(x).replace(",", "").strip()
+                if not s or s.lower() == "nan":
+                    return None
+                return float(s)
+            except Exception:
+                return None
+
+        def price_from_raw(raw_json) -> float | None:
+            d = parse_raw(raw_json)
+            v = pick_by_norm(d, "sellerprice")
+            if v is None:
+                v = pick_by_norm(d, "sellingprice") or pick_by_norm(d, "unitprice") or pick_by_norm(d, "price")
+            return to_float(v)
+
+        def bucket_start(price: float) -> int:
+            b = int(price) // int(bucket_size)
+            return b * int(bucket_size)
+
+        def band_obj(b0: int):
+            return {"from": b0, "to": b0 + int(bucket_size) - 1, "mid": b0 + (int(bucket_size) / 2.0)}
+
+        def confidence_label(days: int, units: int) -> str:
+            if days >= 14 and units >= 100:
+                return "high"
+            if days >= 7 and units >= 30:
+                return "medium"
+            return "low"
+
+        # -----------------------
+        # Brand mapping / filters (CatalogRaw)
+        # Myntra -> style_key -> brand
+        # Flipkart -> seller_sku_code -> brand  (if your catalog has it)
+        # -----------------------
+        style_key_filter = None
+        sku_filter = None
+        style_to_brand = None
+        sku_to_brand = None
+
+        need_catalog_map = (lvl == "brand") or bool(brand) or (key is not None and lvl == "brand")
+        if need_catalog_map:
+            cat_q = (
+                db.query(CatalogRaw.style_key, CatalogRaw.seller_sku_code, CatalogRaw.brand)
+                .filter(CatalogRaw.workspace_id == ws_id)
+            )
+            cat_q = _apply_portal_catalog(cat_q, p)
+
+            cat_rows = cat_q.all()
+
+            style_to_brand = {str(sk): (br or "").strip() for (sk, _, br) in cat_rows if sk is not None}
+            sku_to_brand = {str(ss): (br or "").strip() for (_, ss, br) in cat_rows if ss is not None}
+
+            if brand:
+                bnorm = _norm(brand)
+                if p == "flipkart":
+                    allowed = [ss for ss, br in sku_to_brand.items() if _norm(br) == bnorm]
+                    sku_filter = set(allowed)
+                else:
+                    allowed = [sk for sk, br in style_to_brand.items() if _norm(br) == bnorm]
+                    style_key_filter = set(allowed)
+
+            if lvl == "brand" and key:
+                knorm = _norm(key)
+                if p == "flipkart":
+                    allowed = [ss for ss, br in sku_to_brand.items() if _norm(br) == knorm]
+                    sku_filter = set(allowed)
+                else:
+                    allowed = [sk for sk, br in style_to_brand.items() if _norm(br) == knorm]
+                    style_key_filter = set(allowed)
+
+        # -----------------------
+        # Aggregate sales into (entity_key, bucket)
+        # For Myntra: from SalesRaw using sellerprice from raw_json
+        # For Flipkart: from FlipkartTrafficRaw using (revenue / sales_qty)
+        # -----------------------
+        agg = {}  # (ekey, b0) -> dict
+        entity_overall = {}  # ekey -> dict
+        ts = {}  # date -> dict (deep dive only)
+
+        def get_entity_key(style_key, sku) -> str | None:
+            if lvl == "sku":
+                return (sku or "").strip() or None
+            if lvl == "style":
+                return (style_key or "").strip() or None
+            # lvl == "brand"
+            if p == "flipkart":
+                if sku_to_brand is None:
+                    return None
+                return (sku_to_brand.get(str(sku), "") or "").strip() or None
+            else:
+                if style_to_brand is None:
+                    return None
+                return (style_to_brand.get(str(style_key), "") or "").strip() or None
+
+        if p == "flipkart":
+            # Traffic data is day-wise: impression_date + sales_qty + revenue per SKU
+            tq = (
+                db.query(
+                    FlipkartTrafficRaw.impression_date,
+                    FlipkartTrafficRaw.seller_sku_code,
+                    FlipkartTrafficRaw.sales_qty,
+                    FlipkartTrafficRaw.revenue,
+                )
+                .filter(FlipkartTrafficRaw.workspace_id == ws_id)
+                .filter(FlipkartTrafficRaw.impression_date >= start)
+                .filter(FlipkartTrafficRaw.impression_date <= end)
+            )
+
+            if sku_filter is not None:
+                if len(sku_filter) == 0:
+                    return {
+                        "portal": p,
+                        "level": lvl,
+                        "start": str(start),
+                        "end": str(end),
+                        "bucket_size": int(bucket_size),
+                        "rows": [],
+                        "deep_dive": None,
+                        "note": "No SKUs found for the given brand filter.",
+                    }
+                tq = tq.filter(FlipkartTrafficRaw.seller_sku_code.in_(list(sku_filter)))
+
+            if key and lvl == "sku":
+                tq = tq.filter(FlipkartTrafficRaw.seller_sku_code == key)
+
+            for d, sku, sales_qty, revenue in tq.yield_per(5000):
+                if d is None:
+                    continue
+                ekey = get_entity_key(None, sku)
+                if not ekey:
+                    continue
+
+                u = int(sales_qty or 0)
+                if u <= 0:
+                    continue
+
+                rev = float(revenue or 0.0)
+                if rev <= 0:
+                    continue
+
+                price = rev / u
+                if price <= 0:
+                    continue
+
+                b0 = bucket_start(price)
+                day = d  # already a date
+
+                k = (ekey, b0)
+                rec = agg.get(k)
+                if rec is None:
+                    rec = {"units": 0, "gmv": 0.0, "days": set()}
+                    agg[k] = rec
+                rec["units"] += u
+                rec["gmv"] += rev
+                rec["days"].add(day)
+
+                o = entity_overall.get(ekey)
+                if o is None:
+                    o = {"units": 0, "gmv": 0.0, "days": set()}
+                    entity_overall[ekey] = o
+                o["units"] += u
+                o["gmv"] += rev
+                o["days"].add(day)
+
+                if key:
+                    t = ts.get(day)
+                    if t is None:
+                        t = {"date": str(day), "units": 0, "gmv": 0.0, "asp": None, "returns_units": 0}
+                        ts[day] = t
+                    t["units"] += u
+                    t["gmv"] += rev
+        else:
+            # Myntra (and others): use SalesRaw
+            sales_q = (
+                db.query(
+                    SalesRaw.order_date,
+                    SalesRaw.style_key,
+                    SalesRaw.seller_sku_code,
+                    SalesRaw.units,
+                    SalesRaw.raw_json,
+                )
+                .filter(SalesRaw.workspace_id == ws_id)
+                .filter(SalesRaw.order_date >= start_dt)
+                .filter(SalesRaw.order_date < end_dt_excl)
+            )
+            sales_q = _apply_portal_sales(sales_q, ws_slug, p)
+
+            if style_key_filter is not None:
+                if len(style_key_filter) == 0:
+                    return {
+                        "portal": p,
+                        "level": lvl,
+                        "start": str(start),
+                        "end": str(end),
+                        "bucket_size": int(bucket_size),
+                        "rows": [],
+                        "deep_dive": None,
+                        "note": "No styles found for the given brand filter.",
+                    }
+                sales_q = sales_q.filter(SalesRaw.style_key.in_(list(style_key_filter)))
+
+            if key and lvl == "style":
+                sales_q = sales_q.filter(SalesRaw.style_key == key)
+            elif key and lvl == "sku":
+                sales_q = sales_q.filter(SalesRaw.seller_sku_code == key)
+
+            for odt, sk, sku, units, rj in sales_q.yield_per(5000):
+                if odt is None:
+                    continue
+                ekey = get_entity_key(sk, sku)
+                if not ekey:
+                    continue
+
+                price = price_from_raw(rj)
+                if price is None:
+                    continue
+
+                u = int(units or 0)
+                if u <= 0:
+                    continue
+
+                b0 = bucket_start(price)
+                day = odt.date()
+
+                k = (ekey, b0)
+                rec = agg.get(k)
+                if rec is None:
+                    rec = {"units": 0, "gmv": 0.0, "days": set()}
+                    agg[k] = rec
+                rec["units"] += u
+                rec["gmv"] += float(price) * u
+                rec["days"].add(day)
+
+                o = entity_overall.get(ekey)
+                if o is None:
+                    o = {"units": 0, "gmv": 0.0, "days": set()}
+                    entity_overall[ekey] = o
+                o["units"] += u
+                o["gmv"] += float(price) * u
+                o["days"].add(day)
+
+                if key:
+                    t = ts.get(day)
+                    if t is None:
+                        t = {"date": str(day), "units": 0, "gmv": 0.0, "asp": None, "returns_units": 0}
+                        ts[day] = t
+                    t["units"] += u
+                    t["gmv"] += float(price) * u
+
+        if key:
+            for _, t in ts.items():
+                if t["units"] > 0:
+                    t["asp"] = round(t["gmv"] / t["units"], 2)
+
+        # -----------------------
+        # Returns (only when we can bucket returns by sale-price via SalesRaw join)
+        # If flipkart sales/orders aren't ingested yet, this will naturally be empty.
+        # -----------------------
+        returns_by_bucket = {}  # (ekey, b0) -> dict
+
+        rq = (
+            db.query(
+                ReturnsRaw.units,
+                ReturnsRaw.return_type,
+                ReturnsRaw.return_date,
+                SalesRaw.style_key,
+                SalesRaw.seller_sku_code,
+                SalesRaw.raw_json,
+            )
+            .join(SalesRaw, SalesRaw.order_line_id == ReturnsRaw.order_line_id)
+            .filter(ReturnsRaw.workspace_id == ws_id)
+            .filter(SalesRaw.workspace_id == ws_id)
+            .filter(ReturnsRaw.return_date >= start_dt)
+            .filter(ReturnsRaw.return_date < end_dt_excl)
+        )
+        rq = _apply_portal_returns(rq, ws_slug, p)
+
+        if style_key_filter is not None:
+            rq = rq.filter(SalesRaw.style_key.in_(list(style_key_filter)))
+        if sku_filter is not None:
+            rq = rq.filter(SalesRaw.seller_sku_code.in_(list(sku_filter)))
+
+        if key and lvl == "style":
+            rq = rq.filter(SalesRaw.style_key == key)
+        elif key and lvl == "sku":
+            rq = rq.filter(SalesRaw.seller_sku_code == key)
+
+        for runits, rtype, rdt, sk, sku, srj in rq.yield_per(5000):
+            if rdt is None:
+                continue
+            ekey = get_entity_key(sk, sku)
+            if not ekey:
+                continue
+
+            price = price_from_raw(srj)
+            if price is None:
+                continue
+
+            b0 = bucket_start(price)
+
+            u = int(runits or 0)
+            if u <= 0:
+                u = 1
+
+            rt = (rtype or "").strip().upper()
+            is_rto = ("RTO" in rt)
+
+            kk = (ekey, b0)
+            rrec = returns_by_bucket.get(kk)
+            if rrec is None:
+                rrec = {"returns_total": 0, "returns_rto": 0, "returns_customer": 0}
+                returns_by_bucket[kk] = rrec
+            rrec["returns_total"] += u
+            if is_rto:
+                rrec["returns_rto"] += u
+            else:
+                rrec["returns_customer"] += u
+
+            if key:
+                day = rdt.date()
+                t = ts.get(day)
+                if t is None:
+                    t = {"date": str(day), "units": 0, "gmv": 0.0, "asp": None, "returns_units": 0}
+                    ts[day] = t
+                t["returns_units"] += u
+
+        # -----------------------
+        # Build per-entity recommendations
+        # -----------------------
+        rows_out = []
+        deep_bands = None
+        for ekey, o in entity_overall.items():
+            total_units = int(o["units"] or 0)
+            total_gmv = float(o["gmv"] or 0.0)
+            days_active = len(o["days"])
+            if total_units <= 0 or days_active <= 0:
+                continue
+
+            current_asp = total_gmv / total_units
+
+            buckets = []
+            
+            for (k_ekey, b0), rec in agg.items():
+                if k_ekey != ekey:
+                    continue
+                sold_u = int(rec["units"] or 0)
+                dcount = len(rec["days"])
+                if sold_u <= 0 or dcount <= 0:
+                    continue
+
+                rr = returns_by_bucket.get((ekey, b0), {"returns_total": 0, "returns_rto": 0, "returns_customer": 0})
+                ret_total = int(rr.get("returns_total", 0) or 0)
+                ret_rto = int(rr.get("returns_rto", 0) or 0)
+                ret_cust = int(rr.get("returns_customer", 0) or 0)
+
+                avg_u_day = sold_u / dcount
+                returns_pct = (ret_total / sold_u) if sold_u > 0 else 0.0
+                net_units = sold_u - ret_total
+                avg_net_u_day = net_units / dcount
+
+                buckets.append(
+                    {
+                        "band": band_obj(b0),
+                        "sold_units": sold_u,
+                        "gmv": round(float(rec["gmv"] or 0.0), 2),
+                        "days": dcount,
+                        "avg_units_per_day": round(avg_u_day, 3),
+                        "returns_total": ret_total,
+                        "returns_rto": ret_rto,
+                        "returns_customer": ret_cust,
+                        "returns_pct": round(returns_pct * 100.0, 2),
+                        "net_units": net_units,
+                        "avg_net_units_per_day": round(avg_net_u_day, 3),
+                    }
+                )
+             # If deep-dive (key provided), include full bands table for the selected entity
+            if key and deep_bands is None:
+                deep_bands = sorted(buckets, key=lambda x: int((x.get("band") or {}).get("from") or 0))
+
+            eligible = [b for b in buckets if b["days"] >= int(min_days) and b["sold_units"] >= int(min_units)]
+            if not eligible:
+                eligible = buckets
+
+            def _pick_best(arr, field):
+                best = None
+                for b in arr:
+                    if best is None or float(b.get(field) or 0) > float(best.get(field) or 0):
+                        best = b
+                return best
+
+            best_volume = _pick_best(eligible, "avg_units_per_day")
+            best_net = _pick_best(eligible, "avg_net_units_per_day")
+
+            cur_b0 = bucket_start(current_asp)
+            cur_bucket = None
+            for b in buckets:
+                if int(b["band"]["from"]) == int(cur_b0):
+                    cur_bucket = b
+                    break
+            cur_avg_u_day = float(cur_bucket["avg_units_per_day"]) if cur_bucket else (total_units / days_active)
+
+            lift_units_pct = None
+            if best_volume and cur_avg_u_day > 0:
+                lift_units_pct = round(
+                    ((float(best_volume["avg_units_per_day"]) - cur_avg_u_day) / cur_avg_u_day) * 100.0, 2
+                )
+
+            rows_out.append(
+                {
+                    "key": ekey,
+                    "current_asp": round(current_asp, 2),
+                    "days_active": days_active,
+                    "units": total_units,
+                    "confidence": confidence_label(days_active, total_units),
+                    "current_avg_units_per_day": round(cur_avg_u_day, 3),
+                    "best_volume_band": best_volume,
+                    "best_net_band": best_net,
+                    "lift_units_pct": lift_units_pct,
+                }
+            )
+
+        def sort_key(r):
+            lift = r["lift_units_pct"]
+            if lift is None:
+                lift = -1e9
+            best_u = (r.get("best_volume_band") or {}).get("avg_units_per_day") or 0
+            return (lift, best_u)
+
+        rows_out.sort(key=sort_key, reverse=True)
+        rows_out = rows_out[: int(top_n)]
+
+        
+        deep = None
+        if key:
+         deep = {
+            "timeseries": sorted(ts.values(), key=lambda x: x["date"]),
+            "bands": deep_bands or [],
+         }
+
+        note = "Returns% is based on returns within the selected date range (by return_date)."
+        if p == "flipkart":
+            note = note + " Flipkart ASP is computed from Traffic report (revenue/sales_qty)."
+
+        return {
+            "portal": p,
+            "level": lvl,
+            "start": str(start),
+            "end": str(end),
+            "bucket_size": int(bucket_size),
+            "rows": rows_out,
+            "deep_dive": deep,
+            "note": note,
+        }
+    finally:
+        db.close()
+
+
+
 @app.post("/db/ingest/myntra-weekly-perf")
 async def db_ingest_myntra_weekly_perf(
     file: UploadFile = File(...),
@@ -2565,144 +3200,314 @@ async def db_ingest_flipkart_events(
         db.close()
 
 
-@app.post("/db/ingest/flipkart/listing")
-async def db_ingest_flipkart_listing(
+def _norm_key(s: str) -> str:
+    return "".join(ch for ch in str(s or "").strip().lower() if ch.isalnum())
+
+def _pick(row: dict, header_map: dict, *wanted_norm_keys: str):
+    """
+    row: DictReader row (original headers)
+    header_map: norm(header) -> original header
+    wanted_norm_keys: e.g. ("orderitemid", "order_item_id")
+    """
+    for wn in wanted_norm_keys:
+        h = header_map.get(_norm_key(wn))
+        if h and h in row:
+            v = row.get(h)
+            if v is not None and str(v).strip() != "":
+                return v
+    return None
+
+def _parse_dt_any(x) -> datetime | None:
+    s = str(x or "").strip()
+    if not s:
+        return None
+
+    # common formats seen in FK exports
+    fmts = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%Y-%m-%d %H:%M:%S",
+        "%d-%m-%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M:%S",
+    ]
+    for f in fmts:
+        try:
+            return datetime.strptime(s, f)
+        except Exception:
+            pass
+
+    # last resort: try ISO-ish
+    try:
+        # handles "2025-12-31T00:00:00" etc
+        return datetime.fromisoformat(s.replace("Z", ""))
+    except Exception:
+        return None
+
+
+# ----------------------------
+# Flipkart Orders / Returns Ingest (CSV)
+# ----------------------------
+import io
+import json
+import pandas as pd
+from fastapi import UploadFile, File, Query, HTTPException
+from sqlalchemy import and_
+
+def _get_workspace_id_by_slug(db, ws_slug: str):
+    ws = db.query(Workspace).filter(Workspace.slug == ws_slug).first()
+    if not ws:
+        raise HTTPException(status_code=400, detail=f"Workspace not found: {ws_slug}")
+    return ws.id
+
+def _norm_col(c: str) -> str:
+    return "".join(ch.lower() if ch.isalnum() else "_" for ch in str(c or "")).strip("_")
+
+def _pick_col(df: pd.DataFrame, wanted: str):
+    # match by normalized column name
+    w = _norm_col(wanted)
+    for c in df.columns:
+        if _norm_col(c) == w:
+            return c
+    return None
+
+def _to_int(x, default=1):
+    try:
+        s = str(x).strip()
+        if not s:
+            return default
+        return int(float(s))
+    except Exception:
+        return default
+
+def _to_dt(val):
+    # returns python datetime or None
+    try:
+        if val is None:
+            return None
+        s = str(val).strip()
+        if not s:
+            return None
+        # handles: "2025-12-14 00:00:00.0", "2025-12-14 10:00:00", "20/12/2025"
+        dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
+        if pd.isna(dt):
+            return None
+        return dt.to_pydatetime()
+    except Exception:
+        return None
+
+@app.post("/db/ingest/flipkart/orders")
+async def db_ingest_flipkart_orders(
     file: UploadFile = File(...),
-    replace: bool = False,
     workspace_slug: str = Query("default"),
+    replace: bool = Query(False),
 ):
     """
-    Flipkart Listing Upload (ONE file contains Catalog + Stock)
-    Uses:
-      - FSN column: Flipkart Serial Number  (fallback: FSN)
-      - SKU column: Seller SKU Id           (fallback: SKU)
-      - Stock column priority:
-          Current stock count for your product
-          Your Stock Count
-          System Stock count
+    Flipkart Orders CSV -> sales_raw
+    - order_line_id: fk:{workspace_slug}:{order_item_id}
+    - style_key: fk:{sku}
+    - seller_sku_code: sku
+    - units: quantity
+    - skips CANCELLED rows
+    - replace=true deletes existing flipkart sales for this workspace first
     """
-    content = await file.read()
-    filename = (file.filename or "").lower()
-
-    try:
-        if filename.endswith(".csv"):
-            df = pd.read_csv(io.BytesIO(content), dtype=str, keep_default_na=False)
-        else:
-            df = pd.read_excel(io.BytesIO(content), dtype=str, keep_default_na=False)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read file: {e}")
-
-    fsn_col = "Flipkart Serial Number" if "Flipkart Serial Number" in df.columns else ("FSN" if "FSN" in df.columns else None)
-    sku_col = "Seller SKU Id" if "Seller SKU Id" in df.columns else ("SKU" if "SKU" in df.columns else None)
-
-    if not fsn_col:
-        raise HTTPException(status_code=400, detail="Missing FSN column: expected 'Flipkart Serial Number' (or 'FSN')")
-    if not sku_col:
-        raise HTTPException(status_code=400, detail="Missing SKU column: expected 'Seller SKU Id' (or 'SKU')")
-
-    stock_col = None
-    for c in ["Current stock count for your product", "Your Stock Count", "System Stock count"]:
-        if c in df.columns:
-            stock_col = c
-            break
-
     db = SessionLocal()
     try:
-        ws_slug = (workspace_slug or "default").strip().lower() or "default"
-        ws_id = resolve_workspace_id(db, ws_slug)
+        ws_slug = (workspace_slug or "").strip() or "default"
+        ws_id = _get_workspace_id_by_slug(db, ws_slug)
 
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        df = pd.read_csv(io.BytesIO(content), dtype=str, keep_default_na=False)
+
+        c_order_item_id = _pick_col(df, "order_item_id")
+        c_order_date = _pick_col(df, "order_date")
+        c_sku = _pick_col(df, "sku")
+        c_qty = _pick_col(df, "quantity")
+        c_status = _pick_col(df, "order_item_status")
+
+        missing = [x for x in ["order_item_id","order_date","sku"] if _pick_col(df, x) is None]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Missing required columns: {missing}")
+
+        # DELETE first (replace)
         if replace:
-            # remove only Flipkart-tagged catalog + fk-prefixed stock for this workspace
-            db.query(CatalogRaw).filter(
-                CatalogRaw.workspace_id == ws_id,
-                CatalogRaw.style_key.like("fk:%"),
+            db.query(SalesRaw).filter(
+                SalesRaw.workspace_id == ws_id,
+                SalesRaw.order_line_id.like(f"fk:{ws_slug}:%"),
             ).delete(synchronize_session=False)
-
-            db.query(StockRaw).filter(
-                StockRaw.workspace_id == ws_id,
-                func.lower(func.trim(StockRaw.seller_sku_code)).like("fk:%"),
-            ).delete(synchronize_session=False)
-
             db.commit()
 
-        # ---- Catalog upsert by style_key (CatalogRaw PK is style_key)
-        upserts = 0
-        stock_rows = 0
-        ingested_at = datetime.utcnow()
+        inserted = 0
+        rows = []
 
-        # Aggregate stock by SKU
-        stock_map = {}
-
-        for i in range(len(df)):
-            r = df.iloc[i].to_dict()
-
-            fsn = _fk_norm_l(r.get(fsn_col))
-            if not fsn:
+        for _, r in df.iterrows():
+            order_item_id = str(r.get(c_order_item_id, "")).strip()
+            if not order_item_id:
                 continue
 
-            sku = _fk_norm_l(r.get(sku_col))
-            style_key = f"fk:{fsn}"
-            seller_sku_code = f"fk:{sku}" if sku else None
+            status = str(r.get(c_status, "")).strip().upper() if c_status else ""
+            if "CANCEL" in status:
+                continue
 
-            product_name = _fk_norm(r.get("Product Title")) if "Product Title" in df.columns else None
-            brand = None  # FK listing sample doesn’t provide stable brand
+            sku = str(r.get(c_sku, "")).strip()
+            if not sku:
+                continue
 
-            raw = dict(r)
-            raw["portal"] = "flipkart"
-            raw_json = json.dumps(raw, ensure_ascii=False)
+            odt = _to_dt(r.get(c_order_date))
+            qty = _to_int(r.get(c_qty), default=1) if c_qty else 1
 
-            stmt = insert(CatalogRaw).values(
-                style_key=style_key,
-                seller_sku_code=seller_sku_code,
-                brand=brand,
-                product_name=product_name,
-                style_catalogued_date=None,   # FK doesn't have live date
-                raw_json=raw_json,
-                workspace_id=ws_id,
-            ).on_conflict_do_update(
-    index_elements=["workspace_id", "style_key", "seller_sku_code"],
-    set_=dict(
-        product_name=product_name,
-        raw_json=raw_json,
-    ),
-)
+            order_line_id = f"fk:{ws_slug}:{order_item_id}"
+            style_key = f"fk:{sku}"
+
+            payload = {
+                "order_line_id": order_line_id,
+                "style_key": style_key,
+                "order_date": odt,
+                "seller_sku_code": sku,
+                "units": qty if qty > 0 else 1,
+                "raw_json": json.dumps({k: str(v) for k, v in r.to_dict().items()}),
+                "workspace_id": ws_id,
+            }
+            rows.append(payload)
+
+        if not rows:
+            return {"ok": True, "inserted": 0, "workspace_slug": ws_slug, "note": "No valid rows to insert."}
+
+        # Avoid duplicates without relying on ON CONFLICT (safe even if unique index is broken)
+        # We skip any order_line_id already present for this workspace’s fk prefix.
+        existing = set(
+            x[0]
+            for x in db.query(SalesRaw.order_line_id)
+                .filter(SalesRaw.workspace_id == ws_id)
+                .filter(SalesRaw.order_line_id.like(f"fk:{ws_slug}:%"))
+                .all()
+        )
+
+        final_rows = [p for p in rows if p["order_line_id"] not in existing]
+
+        if final_rows:
+            db.bulk_insert_mappings(SalesRaw, final_rows)
+            db.commit()
+            inserted = len(final_rows)
+
+        return {"ok": True, "inserted": inserted, "workspace_slug": ws_slug}
+
+    finally:
+        db.close()
 
 
-            db.execute(stmt)
-            upserts += 1
+@app.post("/db/ingest/flipkart/returns")
+async def db_ingest_flipkart_returns(
+    file: UploadFile = File(...),
+    workspace_slug: str = Query("default"),
+    replace: bool = Query(False),
+):
+    """
+    Flipkart Returns CSV -> returns_raw
+    - order_line_id: fk:{workspace_slug}:{order_item_id}
+    - style_key: fk:{sku}
+    - seller_sku_code: sku
+    - units: quantity
+    - return_date: return_approval_date (fallback return_completion_date)
+    - return_type: "RTO" if courier_return else "CUSTOMER_RETURN"
+    - replace=true deletes existing flipkart returns for this workspace first
+    """
+    db = SessionLocal()
+    try:
+        ws_slug = (workspace_slug or "").strip() or "default"
+        ws_id = _get_workspace_id_by_slug(db, ws_slug)
 
-            if stock_col and seller_sku_code:
-                qty = _fk_to_int(r.get(stock_col), default=0)
-                stock_map[seller_sku_code] = stock_map.get(seller_sku_code, 0) + max(0, qty)
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Empty file")
 
-        # Insert stock snapshot rows
-        if stock_map:
-            rows = []
-            for sku_norm, qty in stock_map.items():
-                rows.append(
-                    {
-                        "seller_sku_code": sku_norm,
-                        "qty": int(qty),
-                        "ingested_at": ingested_at,
-                        "raw_json": json.dumps({"portal": "flipkart", "source": "listing"}, ensure_ascii=False),
-                        "workspace_id": ws_id,
-                    }
-                )
-            db.execute(StockRaw.__table__.insert(), rows)
-            stock_rows = len(rows)
+        df = pd.read_csv(io.BytesIO(content), dtype=str, keep_default_na=False)
 
-        db.commit()
+        c_order_item_id = _pick_col(df, "order_item_id")
+        c_sku = _pick_col(df, "sku")
+        c_qty = _pick_col(df, "quantity")
 
-        return {
-            "workspace_slug": ws_slug,
-            "inserted_catalog": int(upserts),
-            "inserted_stock": int(stock_rows),
-            "stock_snapshot_at": ingested_at.isoformat(),
-        }
+        # THIS IS THE KEY FIX (your file has approval date filled, requested date empty)
+        c_ret_dt = _pick_col(df, "return_approval_date") or _pick_col(df, "return_completion_date")
 
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Flipkart listing ingest failed: {e}")
+        c_ret_type = _pick_col(df, "return_type")
+        c_status = _pick_col(df, "return_status")
+
+        if not c_order_item_id or not c_sku or not c_ret_dt:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing required columns. Need order_item_id, sku, return_approval_date/return_completion_date",
+            )
+
+        if replace:
+            db.query(ReturnsRaw).filter(
+                ReturnsRaw.workspace_id == ws_id,
+                ReturnsRaw.order_line_id.like(f"fk:{ws_slug}:%"),
+            ).delete(synchronize_session=False)
+            db.commit()
+
+        rows = []
+        for _, r in df.iterrows():
+            order_item_id = str(r.get(c_order_item_id, "")).strip()
+            if not order_item_id:
+                continue
+
+            # optional: skip cancelled return rows
+            st = str(r.get(c_status, "")).strip().lower() if c_status else ""
+            if st == "cancelled":
+                continue
+
+            sku = str(r.get(c_sku, "")).strip()
+            if not sku:
+                continue
+
+            rdt = _to_dt(r.get(c_ret_dt))
+            if rdt is None:
+                continue
+
+            qty = _to_int(r.get(c_qty), default=1) if c_qty else 1
+
+            rt = str(r.get(c_ret_type, "")).strip().lower() if c_ret_type else ""
+            # your file has: customer_return / courier_return
+            # dashboard logic looks for "RTO" substring sometimes, so map courier_return -> RTO
+            mapped_type = "RTO" if "courier" in rt else "CUSTOMER_RETURN"
+
+            payload = {
+                "order_line_id": f"fk:{ws_slug}:{order_item_id}",
+                "style_key": f"fk:{sku}",
+                "return_date": rdt,
+                "return_type": mapped_type,
+                "units": qty if qty > 0 else 1,
+                "seller_sku_code": sku,
+                "raw_json": json.dumps({k: str(v) for k, v in r.to_dict().items()}),
+                "workspace_id": ws_id,
+            }
+            rows.append(payload)
+
+        if not rows:
+            return {"ok": True, "inserted": 0, "workspace_slug": ws_slug, "note": "No valid rows to insert."}
+
+        existing = set(
+            x[0]
+            for x in db.query(ReturnsRaw.order_line_id)
+                .filter(ReturnsRaw.workspace_id == ws_id)
+                .filter(ReturnsRaw.order_line_id.like(f"fk:{ws_slug}:%"))
+                .all()
+        )
+        final_rows = [p for p in rows if p["order_line_id"] not in existing]
+
+        inserted = 0
+        if final_rows:
+            db.bulk_insert_mappings(ReturnsRaw, final_rows)
+            db.commit()
+            inserted = len(final_rows)
+
+        return {"ok": True, "inserted": inserted, "workspace_slug": ws_slug}
+
     finally:
         db.close()
 
@@ -7059,17 +7864,131 @@ def db_kpi_gmv_asp(
     workspace_slug: str | None = Query(None),
     workspace: str = Query("default"),  # backward compat
     brand: str | None = Query(None),
-    portal: str | None = Query(None),   # ✅ add portal
+    portal: str | None = Query(None),   # portal filter
 ):
     db = SessionLocal()
     try:
         ws_slug = (workspace_slug or "").strip() or (workspace or "default")
         ws_id = resolve_workspace_id(db, ws_slug)
 
+        p = _portal_norm(portal)
+
+        # Previous window (same length)
+        window_days = (end - start).days + 1
+        prev_end = start - timedelta(days=1)
+        prev_start = prev_end - timedelta(days=window_days - 1)
+
+        # -----------------------------
+        # ✅ Flipkart: use GSTR NET GMV
+        # -----------------------------
+        if p == "flipkart":
+            allowed_skus: set[str] | None = None
+
+            # Optional brand filter using CatalogRaw -> seller_sku_code/style_key
+            if brand:
+                allowed_skus = set()
+                cat_q = (
+                    db.query(CatalogRaw.style_key, CatalogRaw.seller_sku_code, CatalogRaw.brand)
+                    .filter(CatalogRaw.workspace_id == ws_id)
+                )
+                cat_q = _apply_portal_catalog(cat_q, p)
+
+                bnorm = (brand or "").strip().lower()
+                for sk, sku, br in cat_q.yield_per(5000):
+                    if (br or "").strip().lower() != bnorm:
+                        continue
+                    k = (sku or sk or "").strip()
+                    if k:
+                        allowed_skus.add(k)
+
+                if len(allowed_skus) == 0:
+                    return {
+                        "gmv": 0.0,
+                        "orders": 0,
+                        "units": 0,
+                        "asp": 0.0,
+                        "prev_gmv": 0.0,
+                        "prev_orders": 0,
+                        "prev_units": 0,
+                        "prev_asp": 0.0,
+                        "gmv_change_pct": None,
+                        "asp_change_pct": None,
+                    }
+
+            def gstr_window(d1: date, d2: date):
+                q = (
+                    db.query(
+                        func.coalesce(func.sum(FlipkartGstrSalesRaw.buyer_invoice_amount), 0.0).label("gmv"),
+                        func.count(FlipkartGstrSalesRaw.id).label("orders"),
+                        func.coalesce(func.sum(FlipkartGstrSalesRaw.item_quantity), 0).label("units"),
+                    )
+                    .filter(FlipkartGstrSalesRaw.workspace_id == ws_id)
+                    .filter(FlipkartGstrSalesRaw.order_date.isnot(None))
+                    .filter(FlipkartGstrSalesRaw.order_date >= d1)
+                    .filter(FlipkartGstrSalesRaw.order_date <= d2)
+                )
+                if allowed_skus is not None:
+                    q = q.filter(FlipkartGstrSalesRaw.seller_sku_code.in_(list(allowed_skus)))
+                return q.one()
+
+            cur = gstr_window(start, end)
+            prev = gstr_window(prev_start, prev_end)
+
+            gmv = float(cur.gmv or 0.0)              # ✅ NET GMV (includes negatives)
+            orders = int(cur.orders or 0)            # count of GSTR rows
+            units = int(cur.units or 0)              # sum of item_quantity
+            asp = (gmv / units) if units > 0 else 0.0
+
+            prev_gmv = float(prev.gmv or 0.0)
+            prev_orders = int(prev.orders or 0)
+            prev_units = int(prev.units or 0)
+            prev_asp = (prev_gmv / prev_units) if prev_units > 0 else 0.0
+
+            def pct_change(curr: float, old: float):
+                if old == 0:
+                    return None
+                return float(((curr - old) / old) * 100.0)
+
+            return {
+                "gmv": round(gmv, 2),
+                "orders": orders,
+                "units": units,
+                "asp": round(asp, 2),
+                "prev_gmv": round(prev_gmv, 2),
+                "prev_orders": prev_orders,
+                "prev_units": prev_units,
+                "prev_asp": round(prev_asp, 2),
+                "gmv_change_pct": pct_change(gmv, prev_gmv),
+                "asp_change_pct": pct_change(asp, prev_asp),
+            }
+
+        # -----------------------------
+        # Myntra/others: existing SalesRaw logic
+        # (small fix: try sellerprice first)
+        # -----------------------------
         start_dt = datetime.combine(start, time.min)
         end_dt_excl = datetime.combine(end + timedelta(days=1), time.min)
 
-        # optional brand filter via catalog -> style_key list
+        # ✅ Try common keys: sellerprice -> seller price -> sellingprice
+        sellerprice_txt = cast(SalesRaw.raw_json, JSONB).op("->>")("sellerprice")
+        seller_price_txt = cast(SalesRaw.raw_json, JSONB).op("->>")("seller price")
+        sellingprice_txt = cast(SalesRaw.raw_json, JSONB).op("->>")("sellingprice")
+
+        seller_price_num = cast(
+            func.nullif(
+                func.trim(
+                    func.replace(
+                        func.coalesce(sellerprice_txt, seller_price_txt, sellingprice_txt),
+                        ",",
+                        "",
+                    )
+                ),
+                "",
+            ),
+            Numeric,
+        )
+
+        # Optional brand filter via catalog -> style_key list
         style_key_filter = None
         if brand:
             style_key_filter = [
@@ -7096,13 +8015,6 @@ def db_kpi_gmv_asp(
                     "asp_change_pct": None,
                 }
 
-        # seller price from raw_json (Text -> JSONB)
-        seller_price_txt = cast(SalesRaw.raw_json, JSONB).op("->>")("seller price")
-        seller_price_num = cast(
-            func.nullif(func.trim(func.replace(seller_price_txt, ",", "")), ""),
-            Numeric,
-        )
-
         q = (
             db.query(
                 func.coalesce(func.sum(seller_price_num * SalesRaw.units), 0).label("gmv"),
@@ -7114,11 +8026,9 @@ def db_kpi_gmv_asp(
                 SalesRaw.order_date >= start_dt,
                 SalesRaw.order_date < end_dt_excl,
                 SalesRaw.raw_json.isnot(None),
-                SalesRaw.raw_json.like("{%"),  # safety: only JSON-looking rows
+                SalesRaw.raw_json.like("{%"),
             )
         )
-
-        # ✅ apply portal filter (fixes Myntra ASP)
         q = _apply_portal_sales(q, ws_slug, portal)
 
         if style_key_filter is not None:
@@ -7129,11 +8039,6 @@ def db_kpi_gmv_asp(
         orders = int(row.orders or 0)
         units = int(row.units or 0)
         asp = float(gmv / units) if units > 0 else 0.0
-
-        # Previous window (same length)
-        window_days = (end - start).days + 1
-        prev_end = start - timedelta(days=1)
-        prev_start = prev_end - timedelta(days=window_days - 1)
 
         prev_start_dt = datetime.combine(prev_start, time.min)
         prev_end_dt_excl = datetime.combine(prev_end + timedelta(days=1), time.min)
@@ -7152,8 +8057,6 @@ def db_kpi_gmv_asp(
                 SalesRaw.raw_json.like("{%"),
             )
         )
-
-        # ✅ apply portal filter to prev window too
         q2 = _apply_portal_sales(q2, ws_slug, portal)
 
         if style_key_filter is not None:
@@ -7386,5 +8289,227 @@ def ingest_flipkart_traffic(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"flipkart traffic ingest failed: {e}")
+    finally:
+        db.close()
+
+@app.post("/db/ingest/flipkart-gstr-sales")
+def ingest_flipkart_gstr_sales(
+    workspace_slug: str = Query("default"),
+    replace_range: bool = Query(
+        True,
+        description="If true, delete existing rows for the same workspace within the file's Order Date range before inserting.",
+    ),
+    file: UploadFile = File(...),
+):
+    """
+    Ingest Flipkart GSTR Sales Report (Excel).
+
+    We use (as per your choice):
+      - Timeline date: Order Date
+      - GMV/Amount field: Buyer Invoice Amount
+      - Key: SKU (Flipkart SKU acts as both Style & SKU in our system)
+
+    Notes:
+      - This report can contain negative Buyer Invoice Amount for returns/cancellations.
+        We store raw rows; later we can compute:
+          GMV = sum(Buyer Invoice Amount)
+          Units = sum(Item Quantity)
+          ASP = GMV / Units (guarded)
+    """
+    db = SessionLocal()
+    try:
+        ws_slug = (workspace_slug or "default").strip() or "default"
+        ws_id = resolve_workspace_id(db, ws_slug)
+
+        content = file.file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        # --- load workbook ---
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Unable to read Excel: {e}")
+
+        # pick sheet (case-insensitive)
+        sheet_name = None
+        for sn in wb.sheetnames:
+            if str(sn).strip().lower() == "sales report":
+                sheet_name = sn
+                break
+        if sheet_name is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Sheet 'Sales Report' not found. Sheets present: {wb.sheetnames}",
+            )
+
+        ws = wb[sheet_name]
+
+        # --- header mapping ---
+        header = []
+        for cell in ws[1]:
+            header.append(str(cell.value).strip() if cell.value is not None else "")
+
+        def _ckey(s: str) -> str:
+            return "".join(ch for ch in str(s or "").strip().lower() if ch.isalnum())
+
+        cols = {_ckey(h): i for i, h in enumerate(header)}
+
+        def pick_col(*names: str) -> int | None:
+            for name in names:
+                k = _ckey(name)
+                if k in cols:
+                    return cols[k]
+            return None
+
+        # required
+        idx_sku = pick_col("SKU")
+        idx_qty = pick_col("Item Quantity", "Qty", "Quantity")
+        idx_order_date = pick_col("Order Date")
+        idx_inv_date = pick_col("Buyer Invoice Date", "Invoice Date")
+        idx_inv_amt = pick_col("Buyer Invoice Amount", "Invoice Amount", "Amount")
+
+        # optional
+        idx_order_id = pick_col("Order ID")
+        idx_order_item_id = pick_col("Order Item ID")
+        idx_event_type = pick_col("Event Type")
+        idx_event_sub = pick_col("Event Sub Type")
+        idx_title = pick_col("Product Title/Description", "Product Title")
+
+        missing = []
+        if idx_sku is None:
+            missing.append("SKU")
+        if idx_qty is None:
+            missing.append("Item Quantity")
+        if idx_order_date is None:
+            missing.append("Order Date")
+        if idx_inv_amt is None:
+            missing.append("Buyer Invoice Amount")
+
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing required columns: {missing}. Columns found: {header}",
+            )
+
+        def norm_fk_sku(x: object) -> str:
+            s = str(x or "").strip()
+            if not s:
+                return ""
+            s = s.lower()
+            if not s.startswith("fk:"):
+                s = "fk:" + s
+            return s
+
+        def to_int(x, default=None):
+            try:
+                if x is None or str(x).strip() == "":
+                    return default
+                return int(float(str(x).replace(",", "").strip()))
+            except Exception:
+                return default
+
+        def to_float(x, default=None):
+            try:
+                if x is None or str(x).strip() == "":
+                    return default
+                return float(str(x).replace(",", "").strip())
+            except Exception:
+                return default
+
+        def to_date(x):
+            if x is None or str(x).strip() == "":
+                return None
+            if isinstance(x, datetime):
+                return x.date()
+            try:
+                import datetime as _dt
+                if isinstance(x, _dt.date) and not isinstance(x, _dt.datetime):
+                    return x
+            except Exception:
+                pass
+            s = str(x).strip()
+            try:
+                dtv = datetime.fromisoformat(s.replace(".0", ""))
+                return dtv.date()
+            except Exception:
+                # last-resort: try common format
+                try:
+                    return datetime.strptime(s.split(" ")[0], "%Y-%m-%d").date()
+                except Exception:
+                    return None
+
+        out = []
+        min_d = None
+        max_d = None
+
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            sku_raw = row[idx_sku] if idx_sku is not None else None
+            sku = norm_fk_sku(sku_raw)
+            if not sku:
+                continue
+
+            qty = to_int(row[idx_qty]) if idx_qty is not None else None
+            amt = to_float(row[idx_inv_amt]) if idx_inv_amt is not None else None
+            if amt is None:
+                continue
+
+            od = to_date(row[idx_order_date]) if idx_order_date is not None else None
+            bid = to_date(row[idx_inv_date]) if idx_inv_date is not None else None
+
+            if od is not None:
+                if min_d is None or od < min_d:
+                    min_d = od
+                if max_d is None or od > max_d:
+                    max_d = od
+
+            rec = FlipkartGstrSalesRaw(
+                workspace_id=ws_id,
+                order_id=None if idx_order_id is None else (str(row[idx_order_id]).strip() if row[idx_order_id] is not None else None),
+                order_item_id=None if idx_order_item_id is None else (str(row[idx_order_item_id]).strip() if row[idx_order_item_id] is not None else None),
+                seller_sku_code=sku,
+                order_date=od,
+                buyer_invoice_date=bid,
+                item_quantity=qty,
+                buyer_invoice_amount=amt,
+                event_type=None if idx_event_type is None else (str(row[idx_event_type]).strip() if row[idx_event_type] is not None else None),
+                event_sub_type=None if idx_event_sub is None else (str(row[idx_event_sub]).strip() if row[idx_event_sub] is not None else None),
+                product_title=None if idx_title is None else (str(row[idx_title]).strip() if row[idx_title] is not None else None),
+                raw_json=None,
+                ingested_at=datetime.utcnow(),
+            )
+            out.append(rec)
+
+        if not out:
+            return {"ok": True, "inserted": 0, "deleted": 0, "workspace_slug": ws_slug, "note": "No usable rows found."}
+
+        deleted = 0
+        if replace_range and min_d is not None and max_d is not None:
+            deleted = (
+                db.query(FlipkartGstrSalesRaw)
+                .filter(FlipkartGstrSalesRaw.workspace_id == ws_id)
+                .filter(FlipkartGstrSalesRaw.order_date >= min_d)
+                .filter(FlipkartGstrSalesRaw.order_date <= max_d)
+                .delete(synchronize_session=False)
+            )
+            db.commit()
+
+        db.bulk_save_objects(out)
+        db.commit()
+
+        return {
+            "ok": True,
+            "inserted": len(out),
+            "deleted": deleted,
+            "workspace_slug": ws_slug,
+            "date_range": {"min_order_date": str(min_d) if min_d else None, "max_order_date": str(max_d) if max_d else None},
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"flipkart gstr ingest failed: {e}")
     finally:
         db.close()

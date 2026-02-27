@@ -13,6 +13,8 @@ import {
   type HouseSummaryResponse,
 } from "@/lib/api";
 
+type Portal = "all" | "myntra" | "flipkart";
+
 function fmtINR(n: number) {
   try {
     return new Intl.NumberFormat("en-IN", {
@@ -47,6 +49,9 @@ export default function AdminOverviewPage() {
   const [start, setStart] = React.useState("");
   const [end, setEnd] = React.useState("");
 
+  // NEW: portal filter
+  const [portal, setPortal] = React.useState<Portal>("all");
+
   // data
   const [monthly, setMonthly] = React.useState<HouseMonthlyRow[]>([]);
   const [summary, setSummary] = React.useState<HouseSummaryResponse | null>(null);
@@ -59,10 +64,11 @@ export default function AdminOverviewPage() {
     router.replace("/admin/login");
   }
 
-  async function loadMonthly() {
+  async function loadMonthly(pOverride?: Portal) {
+    const p = pOverride ?? portal;
     setLoadingMonthly(true);
     try {
-      const res = await getHouseMonthly({ months: 12 });
+      const res = await getHouseMonthly({ months: 12, portal: p });
       setMonthly(res.rows || []);
     } catch (e: any) {
       toast.error(String(e?.message ?? e));
@@ -71,21 +77,11 @@ export default function AdminOverviewPage() {
     }
   }
 
- function fmtMonthLabel(ym: string) {
-  // ym = "2025-01"
-  const [yy, mm] = ym.split("-").map((x) => Number(x));
-  if (!yy || !mm) return ym;
-  const d = new Date(yy, mm - 1, 1);
-  const mon = d.toLocaleString("en-US", { month: "short" }); // Jan, Feb...
-  const yr2 = String(yy).slice(-2); // 25
-  return `${mon} ${yr2}`;
-}
-
-
-  async function loadSummary(params?: { start?: string; end?: string }) {
+  async function loadSummary(params?: { start?: string; end?: string }, pOverride?: Portal) {
+    const p = pOverride ?? portal;
     setLoadingSummary(true);
     try {
-      const res = await getHouseSummary(params);
+      const res = await getHouseSummary({ ...(params ?? {}), portal: p });
       setSummary(res);
     } catch (e: any) {
       toast.error(String(e?.message ?? e));
@@ -95,8 +91,10 @@ export default function AdminOverviewPage() {
   }
 
   React.useEffect(() => {
-    loadMonthly();
-    loadSummary(); // default = all-time
+    // initial load (all-time)
+    loadMonthly("all");
+    loadSummary(undefined, "all");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function applyAllTime() {
@@ -121,6 +119,18 @@ export default function AdminOverviewPage() {
     loadSummary({ start: r.start, end: r.end });
   }
 
+  function applyPortal(next: Portal) {
+    setPortal(next);
+    // keep current selection (month / range / all-time) and just refresh data
+    loadMonthly(next);
+
+    if (start && end) {
+      loadSummary({ start, end }, next);
+    } else {
+      loadSummary(undefined, next);
+    }
+  }
+
   const title =
     summary?.mode === "range" && summary.window?.start && summary.window?.end
       ? `House Summary • ${summary.window.start} → ${summary.window.end}`
@@ -143,7 +153,7 @@ export default function AdminOverviewPage() {
       </header>
 
       <main className="px-4 md:px-6 py-6 space-y-4">
-        {/* Top controls: Month + Date Range */}
+        {/* Top controls: Portal + Month + Date Range */}
         <Card className="rounded-2xl">
           <CardHeader className="flex-row items-center justify-between">
             <CardTitle className="text-base">Filters</CardTitle>
@@ -163,8 +173,22 @@ export default function AdminOverviewPage() {
           </CardHeader>
 
           <CardContent className="space-y-4">
-            {/* Month dropdown */}
+            {/* Portal + Month dropdown */}
             <div className="grid gap-3 md:grid-cols-4">
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">Portal</div>
+                <select
+                  className="w-full h-10 rounded-xl border bg-background px-3 text-sm"
+                  value={portal}
+                  onChange={(e) => applyPortal(e.target.value as Portal)}
+                  disabled={loadingMonthly || loadingSummary}
+                >
+                  <option value="all">All</option>
+                  <option value="myntra">Myntra</option>
+                  <option value="flipkart">Flipkart</option>
+                </select>
+              </div>
+
               <div className="md:col-span-2">
                 <div className="text-xs text-muted-foreground mb-1">Quick month</div>
                 <select
@@ -205,7 +229,6 @@ export default function AdminOverviewPage() {
                       ].join(" ")}
                     >
                       <div className="text-xs font-mono text-muted-foreground">{m.month}</div>
-
                       <div className="text-sm font-semibold">{fmtINR(m.gmv)}</div>
                       <div className="text-[11px] text-muted-foreground">
                         Returns: {Number(m.returns_total || 0).toLocaleString()}
@@ -249,6 +272,7 @@ export default function AdminOverviewPage() {
                     setEnd("");
                     loadSummary();
                   }}
+                  disabled={loadingSummary}
                 >
                   Clear
                 </Button>
@@ -324,13 +348,12 @@ export default function AdminOverviewPage() {
                 <tbody>
                   {(summary?.rows ?? []).map((r) => (
                     <tr
-  key={r.workspace_slug}
-  className="border-t cursor-pointer hover:bg-muted/30"
-  onClick={() => {
-    router.push(`/dashboard?workspace=${encodeURIComponent(r.workspace_slug)}`);
-  }}
->
-
+                      key={r.workspace_slug}
+                      className="border-t cursor-pointer hover:bg-muted/30"
+                      onClick={() => {
+                        router.push(`/dashboard?workspace=${encodeURIComponent(r.workspace_slug)}`);
+                      }}
+                    >
                       <td className="p-3">
                         <div className="font-medium">{r.workspace_name}</div>
                         <div className="text-xs text-muted-foreground font-mono">{r.workspace_slug}</div>
