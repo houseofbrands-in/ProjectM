@@ -1252,6 +1252,7 @@ export type AdsRecoRow = {
   purchases: number;
 
   tag: string;
+  listing_id?: string | null;
   why: string;
 };
 
