@@ -201,7 +201,7 @@ def upload_cost_prices(
                 inserted += 1
 
         db.commit()
-        return {"ok": True, "inserted": inserted, "updated": updated, "total": inserted + updated, "workspace_slug": workspace_slug}
+        return {"ok": True, "inserted": inserted + updated, "workspace_slug": workspace_slug}
 
     except HTTPException:
         raise
