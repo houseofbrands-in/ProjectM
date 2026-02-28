@@ -75,9 +75,12 @@ def download_cost_template(
 
         # Also include existing cost prices (so user can update them)
         existing = {}
-        costs = db.query(SkuCostPrice).filter(SkuCostPrice.workspace_id == ws_id).all()
-        for c in costs:
-            existing[c.seller_sku_code] = c.cost_price
+        try:
+            costs = db.query(SkuCostPrice).filter(SkuCostPrice.workspace_id == ws_id).all()
+            for c in costs:
+                existing[c.seller_sku_code] = c.cost_price
+        except Exception:
+            pass  # Table might not have platform column yet
 
         # Build CSV
         output = io.StringIO()
@@ -94,6 +97,8 @@ def download_cost_template(
             media_type="text/csv",
             headers={"Content-Disposition": f"attachment; filename=cost_price_template_{workspace_slug}.csv"},
         )
+    except Exception as e:
+        raise HTTPException(500, f"Template download failed: {e}")
     finally:
         db.close()
 
@@ -457,5 +462,26 @@ def clear_cost_prices(
     except Exception as e:
         db.rollback()
         raise HTTPException(500, f"Clear failed: {e}")
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# MIGRATION: Add platform column to sku_cost_price table
+# ---------------------------------------------------------------------------
+
+@router.post("/migrate")
+def migrate_cost_price_table():
+    """Add platform column to sku_cost_price if it doesn't exist."""
+    db = SessionLocal()
+    try:
+        from sqlalchemy import text
+        db.execute(text("ALTER TABLE sku_cost_price ADD COLUMN IF NOT EXISTS platform VARCHAR"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS ix_sku_cost_price_platform ON sku_cost_price (platform)"))
+        db.commit()
+        return {"ok": True, "message": "platform column added"}
+    except Exception as e:
+        db.rollback()
+        return {"ok": False, "error": str(e)}
     finally:
         db.close()
