@@ -20,6 +20,7 @@ from backend.reconciliation_models import (
     MyntraPgReverse,
     MyntraNonOrderSettlement,
     MyntraOrderFlow,
+    MyntraSkuMap,
 )
 
 router = APIRouter(prefix="/db/recon", tags=["reconciliation"])
@@ -579,8 +580,9 @@ def recon_summary(workspace_slug: str = Query("default")):
             func.coalesce(func.sum(MyntraPgForward.seller_product_amount), 0).label("total_seller_amount"),
             func.coalesce(func.sum(MyntraPgForward.mrp), 0).label("total_mrp"),
             func.coalesce(func.sum(MyntraPgForward.total_discount_amount), 0).label("total_discount"),
+            # total_commission INCLUDES platform_fees — do not add both
             func.coalesce(func.sum(MyntraPgForward.total_commission), 0).label("total_commission"),
-            func.coalesce(func.sum(MyntraPgForward.platform_fees), 0).label("total_platform_fees"),
+            # total_logistics_deduction INCLUDES shipping, pick&pack, fixed, pg fee
             func.coalesce(func.sum(MyntraPgForward.total_logistics_deduction), 0).label("total_logistics"),
             func.coalesce(func.sum(MyntraPgForward.shipping_fee), 0).label("total_shipping_fee"),
             func.coalesce(func.sum(MyntraPgForward.pick_and_pack_fee), 0).label("total_pick_pack"),
@@ -619,14 +621,16 @@ def recon_summary(workspace_slug: str = Query("default")):
                 "total_seller_amount": round(fw.total_seller_amount, 2),
                 "deductions": {
                     "commission": round(abs(fw.total_commission), 2),
-                    "platform_fees": round(abs(fw.total_platform_fees), 2),
                     "logistics": round(abs(fw.total_logistics), 2),
-                    "shipping_fee": round(abs(fw.total_shipping_fee), 2),
-                    "pick_and_pack": round(abs(fw.total_pick_pack), 2),
-                    "fixed_fee": round(abs(fw.total_fixed_fee), 2),
-                    "payment_gateway": round(abs(fw.total_pg_fee), 2),
+                    "logistics_breakdown": {
+                        "shipping_fee": round(abs(fw.total_shipping_fee), 2),
+                        "pick_and_pack": round(abs(fw.total_pick_pack), 2),
+                        "fixed_fee": round(abs(fw.total_fixed_fee), 2),
+                        "payment_gateway": round(abs(fw.total_pg_fee), 2),
+                    },
                     "tcs": round(abs(fw.total_tcs), 2),
                     "tds": round(abs(fw.total_tds), 2),
+                    "total": round(abs(fw.total_commission) + abs(fw.total_logistics) + abs(fw.total_tcs) + abs(fw.total_tds), 2),
                 },
                 "settled": round(fw.total_settled, 2),
                 "pending": round(fw.total_pending, 2),
@@ -740,14 +744,28 @@ def commission_audit(
 def sku_pnl(
     workspace_slug: str = Query("default"),
     top_n: int = Query(50),
+    sort_by: str = Query("net_profit"),
+    sort_dir: str = Query("desc"),
 ):
     """
-    True P&L per SKU:
-    Revenue - Returns - Commission - Logistics - Tax = Net Profit
+    True P&L per SKU with seller SKU mapping.
+    Commission = total_commission (already includes platform_fees — NOT double counted).
+    Logistics = total_logistics_deduction (already includes shipping, pick&pack, etc.).
     """
     db = SessionLocal()
     try:
         ws_id = resolve_workspace_id(db, workspace_slug)
+
+        # Build SKU map lookup
+        sku_map = {}
+        map_rows = db.query(MyntraSkuMap).filter(MyntraSkuMap.workspace_id == ws_id).all()
+        for m in map_rows:
+            sku_map[m.sku_code] = {
+                "seller_sku_code": m.seller_sku_code,
+                "style_id": m.style_id,
+                "style_name": m.style_name,
+                "size": m.size,
+            }
 
         # Forward (sales) by SKU
         fw_q = db.query(
@@ -757,11 +775,13 @@ def sku_pnl(
             func.count(MyntraPgForward.id).label("fw_orders"),
             func.coalesce(func.sum(MyntraPgForward.seller_product_amount), 0).label("fw_revenue"),
             func.coalesce(func.sum(MyntraPgForward.mrp), 0).label("fw_mrp"),
+            func.coalesce(func.sum(MyntraPgForward.total_discount_amount), 0).label("fw_discount"),
             func.coalesce(func.sum(MyntraPgForward.total_commission), 0).label("fw_commission"),
             func.coalesce(func.sum(MyntraPgForward.total_logistics_deduction), 0).label("fw_logistics"),
             func.coalesce(func.sum(MyntraPgForward.tcs_amount), 0).label("fw_tcs"),
             func.coalesce(func.sum(MyntraPgForward.tds_amount), 0).label("fw_tds"),
             func.coalesce(func.sum(MyntraPgForward.total_actual_settlement), 0).label("fw_settled"),
+            func.coalesce(func.sum(MyntraPgForward.amount_pending_settlement), 0).label("fw_pending"),
         ).filter(
             MyntraPgForward.workspace_id == ws_id
         ).group_by(
@@ -797,39 +817,64 @@ def sku_pnl(
             rv = rv_map.get(fw.sku_code, {})
             rv_orders = rv.get("rv_orders", 0)
             rv_amount = rv.get("rv_amount", 0)
-            rv_commission = rv.get("rv_commission", 0)
-            rv_logistics = rv.get("rv_logistics", 0)
 
             gross_revenue = fw.fw_revenue
-            net_revenue = gross_revenue + rv_amount  # rv_amount is typically negative
-            total_commission = abs(fw.fw_commission) + abs(rv_commission)
-            total_logistics = abs(fw.fw_logistics) + abs(rv_logistics)
-            total_tax = abs(fw.fw_tcs) + abs(fw.fw_tds)
-            net_profit = net_revenue - total_commission - total_logistics - total_tax
+            fw_commission = abs(fw.fw_commission)
+            fw_logistics = abs(fw.fw_logistics)
+            tcs = abs(fw.fw_tcs)
+            tds = abs(fw.fw_tds)
+            total_deductions = fw_commission + fw_logistics + tcs + tds
+
+            # Net Profit = Revenue - Deductions + Return adjustments
+            net_profit = gross_revenue - total_deductions + rv_amount
+            total_settled = fw.fw_settled + rv.get("rv_settled", 0)
+
+            mapped = sku_map.get(fw.sku_code, {})
 
             results.append({
                 "sku_code": fw.sku_code,
+                "seller_sku_code": mapped.get("seller_sku_code"),
+                "style_name": mapped.get("style_name"),
+                "size": mapped.get("size"),
                 "brand": fw.brand,
                 "article_type": fw.article_type,
                 "forward_orders": fw.fw_orders,
                 "return_orders": rv_orders,
                 "return_pct": round(rv_orders / fw.fw_orders * 100, 1) if fw.fw_orders else 0,
+                "mrp_total": round(fw.fw_mrp, 2),
+                "discount_total": round(abs(fw.fw_discount), 2),
                 "gross_revenue": round(gross_revenue, 2),
                 "return_deduction": round(rv_amount, 2),
-                "net_revenue": round(net_revenue, 2),
-                "commission": round(total_commission, 2),
-                "logistics": round(total_logistics, 2),
-                "tax_tcs_tds": round(total_tax, 2),
+                "net_revenue": round(gross_revenue + rv_amount, 2),
+                "commission": round(fw_commission, 2),
+                "logistics": round(fw_logistics, 2),
+                "tcs": round(tcs, 2),
+                "tds": round(tds, 2),
+                "total_deductions": round(total_deductions, 2),
                 "net_profit": round(net_profit, 2),
                 "margin_pct": round(net_profit / gross_revenue * 100, 1) if gross_revenue else 0,
+                "settled": round(total_settled, 2),
+                "asp": round(gross_revenue / fw.fw_orders, 2) if fw.fw_orders else 0,
             })
 
-        # Sort by net_profit descending
-        results.sort(key=lambda x: x["net_profit"], reverse=True)
+        # Sort
+        reverse = sort_dir.lower() != "asc"
+        results.sort(key=lambda x: x.get(sort_by, 0) or 0, reverse=reverse)
+
+        totals = {
+            "forward_orders": sum(r["forward_orders"] for r in results),
+            "return_orders": sum(r["return_orders"] for r in results),
+            "gross_revenue": round(sum(r["gross_revenue"] for r in results), 2),
+            "return_deduction": round(sum(r["return_deduction"] for r in results), 2),
+            "commission": round(sum(r["commission"] for r in results), 2),
+            "logistics": round(sum(r["logistics"] for r in results), 2),
+            "net_profit": round(sum(r["net_profit"] for r in results), 2),
+        }
 
         return {
             "workspace_slug": workspace_slug,
             "total_skus": len(results),
+            "totals": totals,
             "rows": results[:top_n],
         }
     finally:
@@ -929,3 +974,104 @@ def penalty_audit(workspace_slug: str = Query("default")):
         }
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Ingest: SKU Map (Listings Report)
+# ---------------------------------------------------------------------------
+
+@router.post("/ingest/myntra/sku-map")
+def ingest_sku_map(
+    workspace_slug: str = Query("default"),
+    replace: bool = Query(True),
+    file: UploadFile = File(...),
+):
+    """Ingest Myntra Listings Report to build sku_code -> seller_sku_code mapping."""
+    db = SessionLocal()
+    try:
+        ws_id = resolve_workspace_id(db, workspace_slug)
+        content = file.file.read()
+        if not content:
+            raise HTTPException(400, "Empty file")
+
+        rows_data = _read_csv(content)
+        if not rows_data:
+            return {"ok": True, "inserted": 0}
+
+        if replace:
+            db.query(MyntraSkuMap).filter(MyntraSkuMap.workspace_id == ws_id).delete(synchronize_session=False)
+            db.commit()
+
+        objs = []
+        for r in rows_data:
+            sku_code = _get(r, "sku_code", "skucode", "sku code")
+            if not sku_code:
+                continue
+            obj = MyntraSkuMap(
+                workspace_id=ws_id,
+                sku_code=sku_code,
+                sku_id=_get(r, "sku_id", "skuid", "sku id"),
+                seller_sku_code=_get(r, "seller_sku_code", "sellerskucode", "seller sku code"),
+                style_id=_get(r, "style_id", "styleid", "style id"),
+                style_name=_get(r, "style_name", "stylename", "style name"),
+                brand=_get(r, "brand"),
+                article_type=_get(r, "article_type", "articletype", "article type"),
+                size=_get(r, "size"),
+                mrp=_get(r, "mrp", converter=_to_float),
+                ingested_at=datetime.utcnow(),
+            )
+            objs.append(obj)
+
+        db.bulk_save_objects(objs)
+        db.commit()
+        return {"ok": True, "inserted": len(objs), "workspace_slug": workspace_slug}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"SKU map ingest failed: {e}")
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Download: SKU P&L as CSV
+# ---------------------------------------------------------------------------
+
+@router.get("/sku-pnl/download")
+def sku_pnl_download(
+    workspace_slug: str = Query("default"),
+    sort_by: str = Query("net_profit"),
+    sort_dir: str = Query("desc"),
+):
+    """Download SKU P&L as CSV."""
+    import csv as csv_mod
+    from fastapi.responses import StreamingResponse
+
+    data = sku_pnl(workspace_slug=workspace_slug, top_n=9999, sort_by=sort_by, sort_dir=sort_dir)
+    rows = data["rows"]
+
+    output = io.StringIO()
+    writer = csv_mod.writer(output)
+    writer.writerow([
+        "SKU Code", "Seller SKU", "Style Name", "Size", "Brand", "Article Type",
+        "Orders", "Returns", "Return%", "MRP Total", "Discount", "Gross Revenue",
+        "Return Deduction", "Net Revenue", "Commission", "Logistics", "TCS", "TDS",
+        "Total Deductions", "Net Profit", "Margin%", "ASP", "Settled"
+    ])
+    for r in rows:
+        writer.writerow([
+            r["sku_code"], r.get("seller_sku_code", ""), r.get("style_name", ""),
+            r.get("size", ""), r["brand"], r["article_type"],
+            r["forward_orders"], r["return_orders"], r["return_pct"],
+            r.get("mrp_total", ""), r.get("discount_total", ""), r["gross_revenue"],
+            r["return_deduction"], r["net_revenue"], r["commission"],
+            r["logistics"], r.get("tcs", ""), r.get("tds", ""), r.get("total_deductions", ""),
+            r["net_profit"], r["margin_pct"], r.get("asp", ""), r.get("settled", ""),
+        ])
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=sku_pnl_{workspace_slug}.csv"},
+    )

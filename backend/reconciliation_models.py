@@ -494,3 +494,23 @@ class MyntraOrderFlow(Base):
 
     raw_json = Column(Text)
     ingested_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+
+class MyntraSkuMap(Base):
+    """Mapping: Myntra sku_code -> seller_sku_code (from Listings Report)"""
+    __tablename__ = "myntra_sku_map"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+
+    sku_code = Column(String, nullable=False, index=True)
+    sku_id = Column(String)
+    seller_sku_code = Column(String, index=True)
+    style_id = Column(String, index=True)
+    style_name = Column(String)
+    brand = Column(String)
+    article_type = Column(String)
+    size = Column(String)
+    mrp = Column(Float)
+
+    ingested_at = Column(DateTime, nullable=False, default=datetime.utcnow)

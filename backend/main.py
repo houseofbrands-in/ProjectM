@@ -39,7 +39,7 @@ from backend.db import SessionLocal, Base, engine
 from backend.models import CatalogRaw, ReturnsRaw, SalesRaw, Workspace, MyntraWeeklyPerfRaw, StockRaw, FlipkartGstrSalesRaw
 
 # ensure tables exist (simple dev-mode migration)
-from backend.reconciliation_models import MyntraPgForward, MyntraPgReverse, MyntraNonOrderSettlement, MyntraOrderFlow
+from backend.reconciliation_models import MyntraPgForward, MyntraPgReverse, MyntraNonOrderSettlement, MyntraOrderFlow, MyntraSkuMap
 Base.metadata.create_all(bind=engine)
 
 from datetime import datetime, timedelta

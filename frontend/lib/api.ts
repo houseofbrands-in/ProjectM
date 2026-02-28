@@ -1326,10 +1326,7 @@ export async function uploadReconPgForward(
     status: opts.status,
     replace: String(opts.replace ?? true),
   });
-  const res = await fetch(`/api/db/recon/ingest/myntra/pg-forward?${qs}`, {
-    method: "POST",
-    body: form,
-  });
+  const res = await fetch(`/api/db/recon/ingest/myntra/pg-forward?${qs}`, { method: "POST", body: form });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.detail || "PG Forward upload failed");
   return data;
@@ -1346,10 +1343,7 @@ export async function uploadReconPgReverse(
     status: opts.status,
     replace: String(opts.replace ?? true),
   });
-  const res = await fetch(`/api/db/recon/ingest/myntra/pg-reverse?${qs}`, {
-    method: "POST",
-    body: form,
-  });
+  const res = await fetch(`/api/db/recon/ingest/myntra/pg-reverse?${qs}`, { method: "POST", body: form });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.detail || "PG Reverse upload failed");
   return data;
@@ -1365,10 +1359,7 @@ export async function uploadReconNonOrder(
     workspace_slug: opts.workspace_slug,
     replace: String(opts.replace ?? true),
   });
-  const res = await fetch(`/api/db/recon/ingest/myntra/non-order-settlement?${qs}`, {
-    method: "POST",
-    body: form,
-  });
+  const res = await fetch(`/api/db/recon/ingest/myntra/non-order-settlement?${qs}`, { method: "POST", body: form });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.detail || "Non-order upload failed");
   return data;
@@ -1384,12 +1375,25 @@ export async function uploadReconOrderFlow(
     workspace_slug: opts.workspace_slug,
     replace: String(opts.replace ?? true),
   });
-  const res = await fetch(`/api/db/recon/ingest/myntra/order-flow?${qs}`, {
-    method: "POST",
-    body: form,
-  });
+  const res = await fetch(`/api/db/recon/ingest/myntra/order-flow?${qs}`, { method: "POST", body: form });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.detail || "Order flow upload failed");
+  return data;
+}
+
+export async function uploadReconSkuMap(
+  file: File,
+  opts: { workspace_slug: string; replace?: boolean }
+) {
+  const form = new FormData();
+  form.append("file", file);
+  const qs = new URLSearchParams({
+    workspace_slug: opts.workspace_slug,
+    replace: String(opts.replace ?? true),
+  });
+  const res = await fetch(`/api/db/recon/ingest/myntra/sku-map?${qs}`, { method: "POST", body: form });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.detail || "SKU map upload failed");
   return data;
 }
 
@@ -1399,31 +1403,20 @@ export async function getReconSummary(params: { workspace_slug?: string }) {
   return apiGet<any>("/db/recon/summary", params);
 }
 
-export async function getReconCommissionAudit(params: {
-  workspace_slug?: string;
-  expected_rate?: number;
-}) {
+export async function getReconCommissionAudit(params: { workspace_slug?: string; expected_rate?: number }) {
   return apiGet<any>("/db/recon/commission-audit", params);
 }
 
-export async function getReconSkuPnl(params: {
-  workspace_slug?: string;
-  top_n?: number;
-}) {
+export async function getReconSkuPnl(params: { workspace_slug?: string; top_n?: number }) {
   return apiGet<any>("/db/recon/sku-pnl", params);
 }
 
-export async function getReconSettlementTracker(params: {
-  workspace_slug?: string;
-}) {
+export async function getReconSettlementTracker(params: { workspace_slug?: string }) {
   return apiGet<any>("/db/recon/settlement-tracker", params);
 }
 
-export async function getReconPenaltyAudit(params: {
-  workspace_slug?: string;
-}) {
+export async function getReconPenaltyAudit(params: { workspace_slug?: string }) {
   return apiGet<any>("/db/recon/penalty-audit", params);
 }
-
 
 
