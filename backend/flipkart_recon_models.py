@@ -72,6 +72,7 @@ class FlipkartSkuPnl(Base):
     amount_pending = Column(Float)
 
     raw_json = Column(Text)
+    report_month = Column(String, index=True)  # e.g. "2026-01"
     ingested_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
 
 

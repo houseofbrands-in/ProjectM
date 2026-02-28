@@ -69,6 +69,7 @@ def _read_excel_sheet(content: bytes, sheet_name: str, skip_rows: int = 2):
 @router.post("/ingest/sku-pnl")
 def ingest_fk_sku_pnl(
     workspace_slug: str = Query("default"),
+    report_month: str = Query(None, description="Report month YYYY-MM, e.g. 2026-01"),
     replace: bool = Query(True),
     file: UploadFile = File(...),
 ):
@@ -159,6 +160,7 @@ def ingest_fk_sku_pnl(
                 net_margins_pct=_tf(r.get("net_margins_pct")),
                 amount_settled=_tf(r.get("amount_settled")),
                 amount_pending=_tf(r.get("amount_pending")),
+                report_month=report_month,
                 ingested_at=datetime.utcnow(),
             )
             objs.append(obj)
@@ -194,10 +196,7 @@ def ingest_fk_order_pnl(
         if not content:
             raise HTTPException(400, "Empty file")
 
-        buf = io.BytesIO(content)
-        xls = pd.ExcelFile(buf)
-        sheet = next((s for s in xls.sheet_names if "order" in s.lower() and "p" in s.lower()), xls.sheet_names[2] if len(xls.sheet_names) > 2 else xls.sheet_names[0])
-        df = pd.read_excel(buf, sheet_name=sheet, header=None, skiprows=2)
+        df = _read_excel_sheet(content, "Orders P&L", skip_rows=2)
         if df.empty:
             return {"ok": True, "inserted": 0}
 
@@ -222,7 +221,7 @@ def ingest_fk_order_pnl(
             "net_earnings", "earnings_per_unit", "net_margins_pct", "_net_margins2",
             "_bank_settlement2", "amount_settled", "amount_pending",
         ]
-        df.columns = col_names[:len(df.columns)] if len(col_names) >= len(df.columns) else (col_names + [f"_x{i}" for i in range(len(df.columns) - len(col_names))])
+        df.columns = col_names[:len(df.columns)]
         df = df.dropna(subset=["order_id"])
 
         if replace:
@@ -314,10 +313,7 @@ def ingest_fk_payment_report(
         if not content:
             raise HTTPException(400, "Empty file")
 
-        buf = io.BytesIO(content)
-        xls = pd.ExcelFile(buf)
-        sheet = next((s for s in xls.sheet_names if "order" in s.lower()), xls.sheet_names[0])
-        df = pd.read_excel(buf, sheet_name=sheet, header=None, skiprows=3)
+        df = _read_excel_sheet(content, "Orders", skip_rows=3)
         if df.empty:
             return {"ok": True, "inserted": 0}
 
@@ -341,10 +337,7 @@ def ingest_fk_payment_report(
             "quantity", "product_sub_category", "additional_info",
             "return_type", "shopsy_order", "item_return_status",
         ]
-        if len(col_names) >= len(df.columns):
-           df.columns = col_names[:len(df.columns)]
-        else:
-            df.columns = col_names + [f"_extra_{i}" for i in range(len(df.columns) - len(col_names))]
+        df.columns = col_names[:len(df.columns)]
         df = df.dropna(subset=["order_id"])
 
         if replace:
@@ -416,8 +409,30 @@ def ingest_fk_payment_report(
 # ANALYTICS ENDPOINTS
 # ===========================================================================
 
+@router.get("/available-months")
+def fk_available_months(workspace_slug: str = Query("default")):
+    """Get list of months with Flipkart data."""
+    db = SessionLocal()
+    try:
+        ws_id = resolve_workspace_id(db, workspace_slug)
+        rows = db.query(
+            FlipkartSkuPnl.report_month,
+            func.count(FlipkartSkuPnl.id).label("skus"),
+            func.coalesce(func.sum(FlipkartSkuPnl.accounted_net_sales), 0).label("revenue"),
+        ).filter(
+            FlipkartSkuPnl.workspace_id == ws_id,
+            FlipkartSkuPnl.report_month.isnot(None),
+        ).group_by(FlipkartSkuPnl.report_month).order_by(FlipkartSkuPnl.report_month).all()
+
+        return {
+            "months": [{"month": r.report_month, "orders": r.skus, "revenue": round(r.revenue, 2)} for r in rows]
+        }
+    finally:
+        db.close()
+
+
 @router.get("/summary")
-def fk_recon_summary(workspace_slug: str = Query("default")):
+def fk_recon_summary(workspace_slug: str = Query("default"), month: Optional[str] = Query(None)):
     """Flipkart reconciliation summary from SKU-level PNL."""
     db = SessionLocal()
     try:
@@ -444,7 +459,10 @@ def fk_recon_summary(workspace_slug: str = Query("default")):
             func.coalesce(func.sum(FlipkartSkuPnl.net_earnings), 0).label("net_earnings"),
             func.coalesce(func.sum(FlipkartSkuPnl.amount_settled), 0).label("settled"),
             func.coalesce(func.sum(FlipkartSkuPnl.amount_pending), 0).label("pending"),
-        ).filter(FlipkartSkuPnl.workspace_id == ws_id).first()
+        ).filter(FlipkartSkuPnl.workspace_id == ws_id)
+        if month:
+            q = q.filter(FlipkartSkuPnl.report_month == month)
+        q = q.first()
 
         return {
             "workspace_slug": workspace_slug,
@@ -485,12 +503,16 @@ def fk_sku_pnl(
     top_n: int = Query(100),
     sort_by: str = Query("net_earnings"),
     sort_dir: str = Query("desc"),
+    month: Optional[str] = Query(None),
 ):
     """Flipkart SKU-level P&L from ingested data."""
     db = SessionLocal()
     try:
         ws_id = resolve_workspace_id(db, workspace_slug)
-        rows = db.query(FlipkartSkuPnl).filter(FlipkartSkuPnl.workspace_id == ws_id).all()
+        q = db.query(FlipkartSkuPnl).filter(FlipkartSkuPnl.workspace_id == ws_id)
+        if month:
+            q = q.filter(FlipkartSkuPnl.report_month == month)
+        rows = q.all()
 
         results = []
         for r in rows:

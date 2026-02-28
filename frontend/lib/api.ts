@@ -1311,7 +1311,6 @@ export async function getAdsRecommendations(args: {
 // =====================
 // Reconciliation API Functions
 // =====================
-// Add these to the bottom of frontend/lib/api.ts
 
 // --- Ingestion ---
 
@@ -1397,17 +1396,17 @@ export async function uploadReconSkuMap(
   return data;
 }
 
-// --- Analytics ---
+// --- Myntra Analytics ---
 
-export async function getReconSummary(params: { workspace_slug?: string }) {
+export async function getReconSummary(params: { workspace_slug?: string; month?: string }) {
   return apiGet<any>("/db/recon/summary", params);
 }
 
-export async function getReconCommissionAudit(params: { workspace_slug?: string; expected_rate?: number }) {
+export async function getReconCommissionAudit(params: { workspace_slug?: string; expected_rate?: number; month?: string }) {
   return apiGet<any>("/db/recon/commission-audit", params);
 }
 
-export async function getReconSkuPnl(params: { workspace_slug?: string; top_n?: number }) {
+export async function getReconSkuPnl(params: { workspace_slug?: string; top_n?: number; month?: string }) {
   return apiGet<any>("/db/recon/sku-pnl", params);
 }
 
@@ -1419,15 +1418,13 @@ export async function getReconPenaltyAudit(params: { workspace_slug?: string }) 
   return apiGet<any>("/db/recon/penalty-audit", params);
 }
 
-// =====================
-// Flipkart Reconciliation API Functions
-// =====================
-// Add these to the bottom of frontend/lib/api.ts
+// --- Flipkart Ingestion ---
 
-export async function uploadFkSkuPnl(file: File, opts: { workspace_slug: string }) {
+export async function uploadFkSkuPnl(file: File, opts: { workspace_slug: string; report_month?: string }) {
   const form = new FormData();
   form.append("file", file);
   const qs = new URLSearchParams({ workspace_slug: opts.workspace_slug });
+  if (opts.report_month) qs.set("report_month", opts.report_month);
   const res = await fetch(`/api/db/recon/flipkart/ingest/sku-pnl?${qs}`, { method: "POST", body: form });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.detail || "FK SKU PNL upload failed");
@@ -1454,18 +1451,17 @@ export async function uploadFkPaymentReport(file: File, opts: { workspace_slug: 
   return data;
 }
 
-export async function getFkReconSummary(params: { workspace_slug?: string }) {
+// --- Flipkart Analytics ---
+
+export async function getFkReconSummary(params: { workspace_slug?: string; month?: string }) {
   return apiGet<any>("/db/recon/flipkart/summary", params);
 }
 
-export async function getFkSkuPnl(params: { workspace_slug?: string; top_n?: number }) {
+export async function getFkSkuPnl(params: { workspace_slug?: string; top_n?: number; month?: string }) {
   return apiGet<any>("/db/recon/flipkart/sku-pnl", params);
 }
 
-// =====================
-// Cost Price & True P&L API Functions
-// =====================
-// Add these to the bottom of frontend/lib/api.ts
+// --- Cost Price & True P&L ---
 
 export async function uploadCostPrices(file: File, opts: { workspace_slug: string }) {
   const form = new FormData();
@@ -1477,6 +1473,6 @@ export async function uploadCostPrices(file: File, opts: { workspace_slug: strin
   return data;
 }
 
-export async function getTruePnl(params: { workspace_slug?: string; platform?: string }) {
+export async function getTruePnl(params: { workspace_slug?: string; platform?: string; month?: string }) {
   return apiGet<any>("/db/recon/cost-price/true-pnl", params);
 }

@@ -107,25 +107,41 @@ export default function ReconciliationPage() {
   const [truePnl, setTruePnl] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [month, setMonth] = useState<string | null>(null);
+  const [availableMonths, setAvailableMonths] = useState<any[]>([]);
+
+  const loadMonths = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/db/recon/available-months?workspace_slug=${workspaceSlug}`);
+      const data = await res.json();
+      setAvailableMonths(data?.months || []);
+    } catch { setAvailableMonths([]); }
+  }, [workspaceSlug]);
 
   const loadData = useCallback(async () => {
     setLoading(true); setError(null);
+    const mp = month ? { workspace_slug: workspaceSlug, month } : { workspace_slug: workspaceSlug };
     try {
       const [sum, comm, pnl, pen, tp] = await Promise.all([
-        getReconSummary({ workspace_slug: workspaceSlug }).catch(() => null),
-        getReconCommissionAudit({ workspace_slug: workspaceSlug }).catch(() => null),
-        getReconSkuPnl({ workspace_slug: workspaceSlug, top_n: 200 }).catch(() => null),
+        getReconSummary(mp).catch(() => null),
+        getReconCommissionAudit(mp).catch(() => null),
+        getReconSkuPnl({ ...mp, top_n: 200 }).catch(() => null),
         getReconPenaltyAudit({ workspace_slug: workspaceSlug }).catch(() => null),
-        getTruePnl({ workspace_slug: workspaceSlug, platform: "myntra" }).catch(() => null),
+        getTruePnl({ workspace_slug: workspaceSlug, platform: "myntra", month: month || undefined }).catch(() => null),
       ]);
       setSummary(sum); setCommission(comm); setSkuPnl(pnl); setPenalties(pen); setTruePnl(tp);
     } catch (e: any) { setError(e.message); }
     finally { setLoading(false); }
-  }, [workspaceSlug]);
+  }, [workspaceSlug, month]);
 
+  useEffect(() => { loadMonths(); }, [loadMonths]);
   useEffect(() => { loadData(); }, [loadData]);
 
   const fw = summary?.forward; const rv = summary?.reverse; const no = summary?.non_order;
+
+  const MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  const fmtMonth = (m: string) => { const [y, mn] = m.split("-"); return `${MONTH_NAMES[parseInt(mn)-1]} ${y}`; };
+  const fmtCur = (n: number) => { if (!n) return "₹0"; if (n >= 100000) return "₹" + (n/100000).toFixed(1) + "L"; if (n >= 1000) return "₹" + (n/1000).toFixed(0) + "K"; return "₹" + n; };
 
   return (
     <div className="space-y-4">
@@ -136,6 +152,32 @@ export default function ReconciliationPage() {
         </div>
         <Button variant="outline" size="sm" onClick={loadData} disabled={loading}>{loading ? "Loading..." : "Refresh"}</Button>
       </div>
+
+      {/* Month Filter */}
+      {availableMonths.length > 0 && (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            <button onClick={() => setMonth(null)} className={cn("rounded-lg border px-3 py-1.5 text-xs font-medium",
+              month === null ? "bg-primary text-primary-foreground" : "bg-background text-muted-foreground hover:bg-muted")}>All-time</button>
+            <select className="rounded-lg border px-2 py-1.5 text-xs" value={month || ""} onChange={(e) => setMonth(e.target.value || null)}>
+              <option value="">Select month...</option>
+              {availableMonths.map((m: any) => <option key={m.month} value={m.month}>{fmtMonth(m.month)}</option>)}
+            </select>
+          </div>
+          <div className="flex gap-2 overflow-x-auto pb-1">
+            {availableMonths.map((m: any) => (
+              <button key={m.month} onClick={() => setMonth(m.month)}
+                className={cn("rounded-lg border px-3 py-2 text-left shrink-0 min-w-[90px]",
+                  month === m.month ? "bg-primary text-primary-foreground" : "bg-background hover:bg-muted")}>
+                <div className="text-[10px] font-medium opacity-80">{m.month}</div>
+                <div className="text-sm font-bold">{fmtCur(m.revenue)}</div>
+                <div className="text-[10px] opacity-70">Orders: {m.orders}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {error && <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div>}
       <div className="flex gap-1 border-b pb-1 overflow-x-auto">
         {TABS.map((t) => (

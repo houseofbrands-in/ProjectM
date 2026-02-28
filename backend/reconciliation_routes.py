@@ -557,11 +557,53 @@ def ingest_order_flow(
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
+# Month filter helper
+# ---------------------------------------------------------------------------
+
+def _month_range(month_str):
+    """Convert 'YYYY-MM' to (start_date, end_date) datetime range."""
+    if not month_str:
+        return None, None
+    year, mon = int(month_str[:4]), int(month_str[5:7])
+    start = datetime(year, mon, 1)
+    if mon == 12:
+        end = datetime(year + 1, 1, 1)
+    else:
+        end = datetime(year, mon + 1, 1)
+    return start, end
+
+
+@router.get("/available-months")
+def recon_available_months(workspace_slug: str = Query("default")):
+    """Get list of months with Myntra data (forward sales)."""
+    db = SessionLocal()
+    try:
+        ws_id = resolve_workspace_id(db, workspace_slug)
+        rows = db.query(
+            func.to_char(MyntraPgForward.packing_date, 'YYYY-MM').label("month"),
+            func.count(MyntraPgForward.id).label("orders"),
+            func.coalesce(func.sum(MyntraPgForward.seller_product_amount), 0).label("revenue"),
+        ).filter(
+            MyntraPgForward.workspace_id == ws_id,
+            MyntraPgForward.packing_date.isnot(None),
+        ).group_by(
+            func.to_char(MyntraPgForward.packing_date, 'YYYY-MM')
+        ).order_by(
+            func.to_char(MyntraPgForward.packing_date, 'YYYY-MM')
+        ).all()
+        return {
+            "months": [{"month": r.month, "orders": r.orders, "revenue": round(r.revenue, 2)} for r in rows]
+        }
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
 # 1. Reconciliation Summary — the big picture
 # ---------------------------------------------------------------------------
 
 @router.get("/summary")
-def recon_summary(workspace_slug: str = Query("default")):
+def recon_summary(workspace_slug: str = Query("default"), month: Optional[str] = Query(None)):
     """
     High-level reconciliation summary:
     - Total forward sales (settled + unsettled)
@@ -573,16 +615,15 @@ def recon_summary(workspace_slug: str = Query("default")):
     db = SessionLocal()
     try:
         ws_id = resolve_workspace_id(db, workspace_slug)
+        m_start, m_end = _month_range(month)
 
         # Forward aggregates
-        fw = db.query(
+        fw_q = db.query(
             func.count(MyntraPgForward.id).label("count"),
             func.coalesce(func.sum(MyntraPgForward.seller_product_amount), 0).label("total_seller_amount"),
             func.coalesce(func.sum(MyntraPgForward.mrp), 0).label("total_mrp"),
             func.coalesce(func.sum(MyntraPgForward.total_discount_amount), 0).label("total_discount"),
-            # total_commission INCLUDES platform_fees — do not add both
             func.coalesce(func.sum(MyntraPgForward.total_commission), 0).label("total_commission"),
-            # total_logistics_deduction INCLUDES shipping, pick&pack, fixed, pg fee
             func.coalesce(func.sum(MyntraPgForward.total_logistics_deduction), 0).label("total_logistics"),
             func.coalesce(func.sum(MyntraPgForward.shipping_fee), 0).label("total_shipping_fee"),
             func.coalesce(func.sum(MyntraPgForward.pick_and_pack_fee), 0).label("total_pick_pack"),
@@ -592,10 +633,13 @@ def recon_summary(workspace_slug: str = Query("default")):
             func.coalesce(func.sum(MyntraPgForward.tds_amount), 0).label("total_tds"),
             func.coalesce(func.sum(MyntraPgForward.total_actual_settlement), 0).label("total_settled"),
             func.coalesce(func.sum(MyntraPgForward.amount_pending_settlement), 0).label("total_pending"),
-        ).filter(MyntraPgForward.workspace_id == ws_id).first()
+        ).filter(MyntraPgForward.workspace_id == ws_id)
+        if m_start:
+            fw_q = fw_q.filter(MyntraPgForward.packing_date >= m_start, MyntraPgForward.packing_date < m_end)
+        fw = fw_q.first()
 
         # Reverse aggregates
-        rv = db.query(
+        rv_q = db.query(
             func.count(MyntraPgReverse.id).label("count"),
             func.coalesce(func.sum(MyntraPgReverse.seller_product_amount), 0).label("total_seller_amount"),
             func.coalesce(func.sum(MyntraPgReverse.total_commission), 0).label("total_commission"),
@@ -604,7 +648,10 @@ def recon_summary(workspace_slug: str = Query("default")):
             func.coalesce(func.sum(MyntraPgReverse.tds_amount), 0).label("total_tds"),
             func.coalesce(func.sum(MyntraPgReverse.total_actual_settlement), 0).label("total_settled"),
             func.coalesce(func.sum(MyntraPgReverse.amount_pending_settlement), 0).label("total_pending"),
-        ).filter(MyntraPgReverse.workspace_id == ws_id).first()
+        ).filter(MyntraPgReverse.workspace_id == ws_id)
+        if m_start:
+            rv_q = rv_q.filter(MyntraPgReverse.packing_date >= m_start, MyntraPgReverse.packing_date < m_end)
+        rv = rv_q.first()
 
         # Non-order
         no = db.query(
@@ -668,6 +715,7 @@ def recon_summary(workspace_slug: str = Query("default")):
 def commission_audit(
     workspace_slug: str = Query("default"),
     expected_rate: float = Query(None, description="Expected commission % to compare against"),
+    month: Optional[str] = Query(None),
 ):
     """
     Compare actual commission charged per order vs expected rate.
@@ -676,6 +724,7 @@ def commission_audit(
     db = SessionLocal()
     try:
         ws_id = resolve_workspace_id(db, workspace_slug)
+        m_start, m_end = _month_range(month)
 
         q = db.query(
             MyntraPgForward.order_release_id,
@@ -691,7 +740,10 @@ def commission_audit(
         ).filter(
             MyntraPgForward.workspace_id == ws_id,
             MyntraPgForward.commission_percentage.isnot(None),
-        ).order_by(MyntraPgForward.commission_percentage.desc())
+        )
+        if m_start:
+            q = q.filter(MyntraPgForward.packing_date >= m_start, MyntraPgForward.packing_date < m_end)
+        q = q.order_by(MyntraPgForward.commission_percentage.desc())
 
         rows = q.all()
 
@@ -746,6 +798,7 @@ def sku_pnl(
     top_n: int = Query(50),
     sort_by: str = Query("net_profit"),
     sort_dir: str = Query("desc"),
+    month: Optional[str] = Query(None),
 ):
     """
     True P&L per SKU with seller SKU mapping.
@@ -755,6 +808,7 @@ def sku_pnl(
     db = SessionLocal()
     try:
         ws_id = resolve_workspace_id(db, workspace_slug)
+        m_start, m_end = _month_range(month)
 
         # Build SKU map lookup
         sku_map = {}
@@ -784,7 +838,10 @@ def sku_pnl(
             func.coalesce(func.sum(MyntraPgForward.amount_pending_settlement), 0).label("fw_pending"),
         ).filter(
             MyntraPgForward.workspace_id == ws_id
-        ).group_by(
+        )
+        if m_start:
+            fw_q = fw_q.filter(MyntraPgForward.packing_date >= m_start, MyntraPgForward.packing_date < m_end)
+        fw_q = fw_q.group_by(
             MyntraPgForward.sku_code,
             MyntraPgForward.brand,
             MyntraPgForward.article_type,
@@ -801,7 +858,10 @@ def sku_pnl(
             func.coalesce(func.sum(MyntraPgReverse.total_actual_settlement), 0).label("rv_settled"),
         ).filter(
             MyntraPgReverse.workspace_id == ws_id
-        ).group_by(MyntraPgReverse.sku_code).all()
+        )
+        if m_start:
+            rv_q = rv_q.filter(MyntraPgReverse.packing_date >= m_start, MyntraPgReverse.packing_date < m_end)
+        rv_q = rv_q.group_by(MyntraPgReverse.sku_code).all()
 
         for rv in rv_q:
             rv_map[rv.sku_code] = {
@@ -826,7 +886,7 @@ def sku_pnl(
             total_deductions = fw_commission + fw_logistics + tcs + tds
 
             # Net Profit = Revenue - Deductions + Return adjustments
-            net_profit = gross_revenue - total_deductions - abs(rv_amount)
+            net_profit = gross_revenue - total_deductions + rv_amount
             total_settled = fw.fw_settled + rv.get("rv_settled", 0)
 
             mapped = sku_map.get(fw.sku_code, {})
@@ -844,8 +904,8 @@ def sku_pnl(
                 "mrp_total": round(fw.fw_mrp, 2),
                 "discount_total": round(abs(fw.fw_discount), 2),
                 "gross_revenue": round(gross_revenue, 2),
-                "return_deduction": round(-abs(rv_amount), 2),
-                "net_revenue": round(gross_revenue - abs(rv_amount), 2),
+                "return_deduction": round(rv_amount, 2),
+                "net_revenue": round(gross_revenue + rv_amount, 2),
                 "commission": round(fw_commission, 2),
                 "logistics": round(fw_logistics, 2),
                 "tcs": round(tcs, 2),
@@ -1043,12 +1103,13 @@ def sku_pnl_download(
     workspace_slug: str = Query("default"),
     sort_by: str = Query("net_profit"),
     sort_dir: str = Query("desc"),
+    month: Optional[str] = Query(None),
 ):
     """Download SKU P&L as CSV."""
     import csv as csv_mod
     from fastapi.responses import StreamingResponse
 
-    data = sku_pnl(workspace_slug=workspace_slug, top_n=9999, sort_by=sort_by, sort_dir=sort_dir)
+    data = sku_pnl(workspace_slug=workspace_slug, top_n=9999, sort_by=sort_by, sort_dir=sort_dir, month=month)
     rows = data["rows"]
 
     output = io.StringIO()

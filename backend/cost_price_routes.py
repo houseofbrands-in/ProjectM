@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import csv as csv_mod
 from datetime import datetime
+from typing import Optional
 
 import pandas as pd
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
@@ -201,7 +202,7 @@ def upload_cost_prices(
                 inserted += 1
 
         db.commit()
-        return {"ok": True, "inserted": inserted + updated, "workspace_slug": workspace_slug}
+        return {"ok": True, "inserted": inserted, "updated": updated, "total": inserted + updated, "workspace_slug": workspace_slug}
 
     except HTTPException:
         raise
@@ -222,6 +223,7 @@ def true_pnl(
     platform: str = Query("all", description="myntra, flipkart, or all"),
     sort_by: str = Query("true_profit"),
     sort_dir: str = Query("desc"),
+    month: Optional[str] = Query(None),
 ):
     """
     True P&L per SKU = Marketplace Earnings - (Cost Price × Units Sold).
@@ -243,7 +245,10 @@ def true_pnl(
         if platform in ("flipkart", "all"):
             try:
                 from backend.flipkart_recon_models import FlipkartSkuPnl
-                fk_rows = db.query(FlipkartSkuPnl).filter(FlipkartSkuPnl.workspace_id == ws_id).all()
+                fk_q = db.query(FlipkartSkuPnl).filter(FlipkartSkuPnl.workspace_id == ws_id)
+                if month:
+                    fk_q = fk_q.filter(FlipkartSkuPnl.report_month == month)
+                fk_rows = fk_q.all()
                 for r in fk_rows:
                     sku = r.sku_id
                     cp = cost_map.get(sku)
@@ -298,7 +303,14 @@ def true_pnl(
                     func.coalesce(func.sum(MyntraPgForward.total_logistics_deduction), 0).label("fw_logistics"),
                     func.coalesce(func.sum(MyntraPgForward.tcs_amount), 0).label("fw_tcs"),
                     func.coalesce(func.sum(MyntraPgForward.tds_amount), 0).label("fw_tds"),
-                ).filter(MyntraPgForward.workspace_id == ws_id).group_by(
+                ).filter(MyntraPgForward.workspace_id == ws_id)
+                if month:
+                    from datetime import datetime as dt2
+                    yr, mn = int(month[:4]), int(month[5:7])
+                    ms = dt2(yr, mn, 1)
+                    me = dt2(yr + 1, 1, 1) if mn == 12 else dt2(yr, mn + 1, 1)
+                    fw_q = fw_q.filter(MyntraPgForward.packing_date >= ms, MyntraPgForward.packing_date < me)
+                fw_q = fw_q.group_by(
                     MyntraPgForward.sku_code, MyntraPgForward.brand, MyntraPgForward.article_type
                 ).all()
 
@@ -308,7 +320,10 @@ def true_pnl(
                     MyntraPgReverse.sku_code,
                     func.count(MyntraPgReverse.id).label("rv_orders"),
                     func.coalesce(func.sum(MyntraPgReverse.seller_product_amount), 0).label("rv_amount"),
-                ).filter(MyntraPgReverse.workspace_id == ws_id).group_by(MyntraPgReverse.sku_code).all()
+                ).filter(MyntraPgReverse.workspace_id == ws_id)
+                if month:
+                    rv_q = rv_q.filter(MyntraPgReverse.packing_date >= ms, MyntraPgReverse.packing_date < me)
+                rv_q = rv_q.group_by(MyntraPgReverse.sku_code).all()
 
                 for rv in rv_q:
                     rv_map[rv.sku_code] = {"rv_orders": rv.rv_orders, "rv_amount": rv.rv_amount}
