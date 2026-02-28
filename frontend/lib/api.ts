@@ -1462,3 +1462,21 @@ export async function getFkSkuPnl(params: { workspace_slug?: string; top_n?: num
   return apiGet<any>("/db/recon/flipkart/sku-pnl", params);
 }
 
+// =====================
+// Cost Price & True P&L API Functions
+// =====================
+// Add these to the bottom of frontend/lib/api.ts
+
+export async function uploadCostPrices(file: File, opts: { workspace_slug: string }) {
+  const form = new FormData();
+  form.append("file", file);
+  const qs = new URLSearchParams({ workspace_slug: opts.workspace_slug });
+  const res = await fetch(`/api/db/recon/cost-price/upload?${qs}`, { method: "POST", body: form });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.detail || "Cost price upload failed");
+  return data;
+}
+
+export async function getTruePnl(params: { workspace_slug?: string; platform?: string }) {
+  return apiGet<any>("/db/recon/cost-price/true-pnl", params);
+}
