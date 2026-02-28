@@ -194,7 +194,10 @@ def ingest_fk_order_pnl(
         if not content:
             raise HTTPException(400, "Empty file")
 
-        df = _read_excel_sheet(content, "Orders P&L", skip_rows=2)
+        buf = io.BytesIO(content)
+        xls = pd.ExcelFile(buf)
+        sheet = next((s for s in xls.sheet_names if "order" in s.lower() and "p" in s.lower()), xls.sheet_names[2] if len(xls.sheet_names) > 2 else xls.sheet_names[0])
+        df = pd.read_excel(buf, sheet_name=sheet, header=None, skiprows=2)
         if df.empty:
             return {"ok": True, "inserted": 0}
 
@@ -311,7 +314,10 @@ def ingest_fk_payment_report(
         if not content:
             raise HTTPException(400, "Empty file")
 
-        df = _read_excel_sheet(content, "Orders", skip_rows=3)
+        buf = io.BytesIO(content)
+        xls = pd.ExcelFile(buf)
+        sheet = next((s for s in xls.sheet_names if "order" in s.lower()), xls.sheet_names[0])
+        df = pd.read_excel(buf, sheet_name=sheet, header=None, skiprows=3)
         if df.empty:
             return {"ok": True, "inserted": 0}
 
