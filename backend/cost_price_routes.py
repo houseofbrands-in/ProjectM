@@ -118,7 +118,6 @@ def download_cost_template(
 @router.post("/upload")
 def upload_cost_prices(
     workspace_slug: str = Query("default"),
-    replace: bool = Query(True),
     file: UploadFile = File(...),
 ):
     """Upload filled cost price CSV/Excel. Expects columns: seller_sku_code, cost_price."""
@@ -169,26 +168,40 @@ def upload_cost_prices(
         if df.empty:
             return {"ok": True, "inserted": 0, "message": "No valid cost prices found"}
 
-        if replace:
-            db.query(SkuCostPrice).filter(SkuCostPrice.workspace_id == ws_id).delete(synchronize_session=False)
-            db.commit()
-
-        objs = []
+        # Upsert: update existing, insert new (don't wipe other platform's costs)
+        updated = 0
+        inserted = 0
         for _, r in df.iterrows():
-            obj = SkuCostPrice(
-                workspace_id=ws_id,
-                seller_sku_code=str(r["seller_sku_code"]).strip(),
-                cost_price=float(r["cost_price"]),
-                sku_name=str(r.get("sku_name", "")).strip() if pd.notna(r.get("sku_name")) else None,
-                brand=str(r.get("brand", "")).strip() if pd.notna(r.get("brand")) else None,
-                category=str(r.get("category", "")).strip() if pd.notna(r.get("category")) else None,
-                updated_at=datetime.utcnow(),
-            )
-            objs.append(obj)
+            sku = str(r["seller_sku_code"]).strip()
+            cp = float(r["cost_price"])
+            existing = db.query(SkuCostPrice).filter(
+                SkuCostPrice.workspace_id == ws_id,
+                SkuCostPrice.seller_sku_code == sku,
+            ).first()
 
-        db.bulk_save_objects(objs)
+            if existing:
+                existing.cost_price = cp
+                existing.updated_at = datetime.utcnow()
+                if pd.notna(r.get("sku_name")) and str(r.get("sku_name", "")).strip():
+                    existing.sku_name = str(r["sku_name"]).strip()
+                if pd.notna(r.get("brand")) and str(r.get("brand", "")).strip():
+                    existing.brand = str(r["brand"]).strip()
+                updated += 1
+            else:
+                obj = SkuCostPrice(
+                    workspace_id=ws_id,
+                    seller_sku_code=sku,
+                    cost_price=cp,
+                    sku_name=str(r.get("sku_name", "")).strip() if pd.notna(r.get("sku_name")) else None,
+                    brand=str(r.get("brand", "")).strip() if pd.notna(r.get("brand")) else None,
+                    category=str(r.get("category", "")).strip() if pd.notna(r.get("category")) else None,
+                    updated_at=datetime.utcnow(),
+                )
+                db.add(obj)
+                inserted += 1
+
         db.commit()
-        return {"ok": True, "inserted": len(objs), "workspace_slug": workspace_slug}
+        return {"ok": True, "inserted": inserted, "updated": updated, "total": inserted + updated, "workspace_slug": workspace_slug}
 
     except HTTPException:
         raise
