@@ -267,7 +267,7 @@ function UploadTab({ workspaceSlug, onDone }: { workspaceSlug: string; onDone: (
         </Button>
       </div>
 
-      {/* Replace / Append toggle */}
+      {/* Replace / Append toggles */}
       <label className="flex items-center gap-2 text-sm cursor-pointer">
         <input type="checkbox" checked={replaceMode} onChange={(e) => setReplaceMode(e.target.checked)} className="rounded" />
         <span className="font-medium">Replace mode</span>
