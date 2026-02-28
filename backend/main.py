@@ -39,6 +39,7 @@ from backend.db import SessionLocal, Base, engine
 from backend.models import CatalogRaw, ReturnsRaw, SalesRaw, Workspace, MyntraWeeklyPerfRaw, StockRaw, FlipkartGstrSalesRaw
 
 # ensure tables exist (simple dev-mode migration)
+from backend.reconciliation_models import MyntraPgForward, MyntraPgReverse, MyntraNonOrderSettlement, MyntraOrderFlow
 Base.metadata.create_all(bind=engine)
 
 from datetime import datetime, timedelta
@@ -60,7 +61,6 @@ from fastapi import UploadFile, File, Query
 from sqlalchemy import cast
 from sqlalchemy.dialects.postgresql import JSONB
 
-from backend.reconciliation_models import MyntraPgForward, MyntraPgReverse, MyntraNonOrderSettlement, MyntraOrderFlow
 from backend.reconciliation_routes import router as recon_router
 
 app = FastAPI(title="Project M API")
