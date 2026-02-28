@@ -284,10 +284,10 @@ function UploadTab({ workspaceSlug, onDone }: { workspaceSlug: string; onDone: (
   };
 
   const handleDeleteCosts = async () => {
-    if (!confirm("Delete all cost prices? This affects both Myntra & Flipkart True P&L.")) return;
+    if (!confirm("Delete Myntra cost prices?")) return;
     try {
-      const res = await fetch(`/api/db/recon/cost-price/clear-all?workspace_slug=${workspaceSlug}`, { method: "DELETE" });
-      if (res.ok) { toast.success("Cost prices deleted"); onDone(); }
+      const res = await fetch(`/api/db/recon/cost-price/clear-all?workspace_slug=${workspaceSlug}&platform=myntra`, { method: "DELETE" });
+      if (res.ok) { toast.success("Myntra cost prices deleted"); onDone(); }
     } catch (e: any) { toast.error(e.message); }
   };
 
@@ -329,7 +329,7 @@ function UploadTab({ workspaceSlug, onDone }: { workspaceSlug: string; onDone: (
         <div className="flex items-center justify-between mb-2">
           <div className="text-sm font-medium">Cost Price (for True P&amp;L)</div>
           <Button variant="outline" size="sm" className="text-red-600 border-red-200 hover:bg-red-50" onClick={handleDeleteCosts}>
-            🗑 Clear Costs
+            🗑 Clear Myntra Costs
           </Button>
         </div>
         <div className="text-xs text-muted-foreground mb-3">Download template with your SKU codes pre-filled, add cost prices, upload back.</div>
@@ -343,7 +343,13 @@ function UploadTab({ workspaceSlug, onDone }: { workspaceSlug: string; onDone: (
           </div>
           <UploadSlot label="2. Upload Cost Prices" description="Upload filled CSV with cost_price column"
             accept=".csv,.xlsx"
-            onUpload={(f) => uploadCostPrices(f, { workspace_slug: workspaceSlug })} />
+            onUpload={(f) => {
+              const form = new FormData();
+              form.append("file", f);
+              const qs = new URLSearchParams({ workspace_slug: workspaceSlug, platform: "myntra" });
+              return fetch(`/api/db/recon/cost-price/upload?${qs}`, { method: "POST", body: form })
+                .then(r => r.json().then(d => { if (!r.ok) throw new Error(d?.detail || "Upload failed"); return d; }));
+            }} />
         </div>
       </div>
 

@@ -105,6 +105,7 @@ def download_cost_template(
 @router.post("/upload")
 def upload_cost_prices(
     workspace_slug: str = Query("default"),
+    platform: str = Query("all", description="myntra, flipkart, or all"),
     file: UploadFile = File(...),
 ):
     """Upload filled cost price CSV/Excel. Expects columns: seller_sku_code, cost_price."""
@@ -155,16 +156,25 @@ def upload_cost_prices(
         if df.empty:
             return {"ok": True, "inserted": 0, "message": "No valid cost prices found"}
 
-        # Upsert: update existing, insert new (don't wipe other platform's costs)
+        # Determine platform from file or param
+        row_platform = platform if platform != "all" else None
+
+        # Upsert: update existing, insert new (per platform)
         updated = 0
         inserted = 0
         for _, r in df.iterrows():
             sku = str(r["seller_sku_code"]).strip()
             cp = float(r["cost_price"])
-            existing = db.query(SkuCostPrice).filter(
+            # Use platform from row if available, else from param
+            p = str(r.get("platform", "")).strip().lower() if pd.notna(r.get("platform")) else row_platform
+
+            q = db.query(SkuCostPrice).filter(
                 SkuCostPrice.workspace_id == ws_id,
                 SkuCostPrice.seller_sku_code == sku,
-            ).first()
+            )
+            if p:
+                q = q.filter(SkuCostPrice.platform == p)
+            existing = q.first()
 
             if existing:
                 existing.cost_price = cp
@@ -179,6 +189,7 @@ def upload_cost_prices(
                     workspace_id=ws_id,
                     seller_sku_code=sku,
                     cost_price=cp,
+                    platform=p,
                     sku_name=str(r.get("sku_name", "")).strip() if pd.notna(r.get("sku_name")) else None,
                     brand=str(r.get("brand", "")).strip() if pd.notna(r.get("brand")) else None,
                     category=str(r.get("category", "")).strip() if pd.notna(r.get("category")) else None,
@@ -188,7 +199,7 @@ def upload_cost_prices(
                 inserted += 1
 
         db.commit()
-        return {"ok": True, "inserted": inserted, "updated": updated, "total": inserted + updated, "workspace_slug": workspace_slug}
+        return {"ok": True, "inserted": inserted + updated, "workspace_slug": workspace_slug}
 
     except HTTPException:
         raise
@@ -221,9 +232,18 @@ def true_pnl(
 
         # Load cost prices
         cost_map = {}
-        costs = db.query(SkuCostPrice).filter(SkuCostPrice.workspace_id == ws_id).all()
+        cost_q = db.query(SkuCostPrice).filter(SkuCostPrice.workspace_id == ws_id)
+        costs = cost_q.all()
+        # Build per-platform cost maps
+        cost_map_all = {}  # SKU -> cost (any platform)
+        cost_map_fk = {}   # SKU -> cost (flipkart only)
+        cost_map_mn = {}   # SKU -> cost (myntra only)
         for c in costs:
-            cost_map[c.seller_sku_code] = c.cost_price
+            cost_map_all[c.seller_sku_code] = c.cost_price
+            if c.platform == "flipkart":
+                cost_map_fk[c.seller_sku_code] = c.cost_price
+            elif c.platform == "myntra":
+                cost_map_mn[c.seller_sku_code] = c.cost_price
 
         results = []
 
@@ -237,7 +257,7 @@ def true_pnl(
                 fk_rows = fk_q.all()
                 for r in fk_rows:
                     sku = r.sku_id
-                    cp = cost_map.get(sku)
+                    cp = cost_map_fk.get(sku) or cost_map_all.get(sku)
                     net_units = r.net_units or 0
                     net_sales = r.accounted_net_sales or 0
                     marketplace_earnings = r.net_earnings or 0
@@ -295,7 +315,7 @@ def true_pnl(
                     yr, mn = int(month[:4]), int(month[5:7])
                     ms = dt2(yr, mn, 1)
                     me = dt2(yr + 1, 1, 1) if mn == 12 else dt2(yr, mn + 1, 1)
-                    fw_q = fw_q.filter(MyntraPgForward.packing_date >= ms, MyntraPgForward.packing_date < me)
+                    fw_q = fw_q.filter(MyntraPgForward.settlement_date_prepaid_payment >= ms, MyntraPgForward.settlement_date_prepaid_payment < me)
                 fw_q = fw_q.group_by(
                     MyntraPgForward.sku_code, MyntraPgForward.brand, MyntraPgForward.article_type
                 ).all()
@@ -308,7 +328,7 @@ def true_pnl(
                     func.coalesce(func.sum(MyntraPgReverse.seller_product_amount), 0).label("rv_amount"),
                 ).filter(MyntraPgReverse.workspace_id == ws_id)
                 if month:
-                    rv_q = rv_q.filter(MyntraPgReverse.packing_date >= ms, MyntraPgReverse.packing_date < me)
+                    rv_q = rv_q.filter(MyntraPgReverse.settlement_date_prepaid_payment >= ms, MyntraPgReverse.settlement_date_prepaid_payment < me)
                 rv_q = rv_q.group_by(MyntraPgReverse.sku_code).all()
 
                 for rv in rv_q:
@@ -327,7 +347,7 @@ def true_pnl(
                     marketplace_earnings = gross_revenue - deductions - rv_amount
                     net_units = fw.fw_orders - rv_orders
 
-                    cp = cost_map.get(seller_sku)
+                    cp = cost_map_mn.get(seller_sku) or cost_map_all.get(seller_sku)
                     cogs = (cp * net_units) if cp and net_units > 0 else None
                     true_profit = (marketplace_earnings - cogs) if cogs is not None else None
                     true_margin = (true_profit / gross_revenue * 100) if true_profit is not None and gross_revenue else None
@@ -420,14 +440,20 @@ def true_pnl_download(
 # ---------------------------------------------------------------------------
 
 @router.delete("/clear-all")
-def clear_cost_prices(workspace_slug: str = Query("default")):
-    """Delete ALL cost prices for a workspace."""
+def clear_cost_prices(
+    workspace_slug: str = Query("default"),
+    platform: str = Query("all", description="myntra, flipkart, or all"),
+):
+    """Delete cost prices — optionally per platform."""
     db = SessionLocal()
     try:
         ws_id = resolve_workspace_id(db, workspace_slug)
-        c = db.query(SkuCostPrice).filter(SkuCostPrice.workspace_id == ws_id).delete(synchronize_session=False)
+        q = db.query(SkuCostPrice).filter(SkuCostPrice.workspace_id == ws_id)
+        if platform != "all":
+            q = q.filter(SkuCostPrice.platform == platform)
+        c = q.delete(synchronize_session=False)
         db.commit()
-        return {"ok": True, "deleted": c, "workspace_slug": workspace_slug}
+        return {"ok": True, "deleted": c, "platform": platform, "workspace_slug": workspace_slug}
     except Exception as e:
         db.rollback()
         raise HTTPException(500, f"Clear failed: {e}")

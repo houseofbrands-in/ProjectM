@@ -16,6 +16,7 @@ class SkuCostPrice(Base):
 
     seller_sku_code = Column(String, nullable=False, index=True)
     cost_price = Column(Float, nullable=False)
+    platform = Column(String, index=True)  # "myntra", "flipkart", or null for shared
 
     # Optional metadata
     sku_name = Column(String)

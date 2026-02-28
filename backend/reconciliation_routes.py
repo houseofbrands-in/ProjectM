@@ -575,21 +575,21 @@ def _month_range(month_str):
 
 @router.get("/available-months")
 def recon_available_months(workspace_slug: str = Query("default")):
-    """Get list of months with Myntra data (forward sales)."""
+    """Get list of months by settlement date (when Myntra paid you)."""
     db = SessionLocal()
     try:
         ws_id = resolve_workspace_id(db, workspace_slug)
         rows = db.query(
-            func.to_char(MyntraPgForward.packing_date, 'YYYY-MM').label("month"),
+            func.to_char(MyntraPgForward.settlement_date_prepaid_payment, 'YYYY-MM').label("month"),
             func.count(MyntraPgForward.id).label("orders"),
             func.coalesce(func.sum(MyntraPgForward.seller_product_amount), 0).label("revenue"),
         ).filter(
             MyntraPgForward.workspace_id == ws_id,
-            MyntraPgForward.packing_date.isnot(None),
+            MyntraPgForward.settlement_date_prepaid_payment.isnot(None),
         ).group_by(
-            func.to_char(MyntraPgForward.packing_date, 'YYYY-MM')
+            func.to_char(MyntraPgForward.settlement_date_prepaid_payment, 'YYYY-MM')
         ).order_by(
-            func.to_char(MyntraPgForward.packing_date, 'YYYY-MM')
+            func.to_char(MyntraPgForward.settlement_date_prepaid_payment, 'YYYY-MM')
         ).all()
         return {
             "months": [{"month": r.month, "orders": r.orders, "revenue": round(r.revenue, 2)} for r in rows]
@@ -635,7 +635,7 @@ def recon_summary(workspace_slug: str = Query("default"), month: Optional[str] =
             func.coalesce(func.sum(MyntraPgForward.amount_pending_settlement), 0).label("total_pending"),
         ).filter(MyntraPgForward.workspace_id == ws_id)
         if m_start:
-            fw_q = fw_q.filter(MyntraPgForward.packing_date >= m_start, MyntraPgForward.packing_date < m_end)
+            fw_q = fw_q.filter(MyntraPgForward.settlement_date_prepaid_payment >= m_start, MyntraPgForward.settlement_date_prepaid_payment < m_end)
         fw = fw_q.first()
 
         # Reverse aggregates
@@ -650,7 +650,7 @@ def recon_summary(workspace_slug: str = Query("default"), month: Optional[str] =
             func.coalesce(func.sum(MyntraPgReverse.amount_pending_settlement), 0).label("total_pending"),
         ).filter(MyntraPgReverse.workspace_id == ws_id)
         if m_start:
-            rv_q = rv_q.filter(MyntraPgReverse.packing_date >= m_start, MyntraPgReverse.packing_date < m_end)
+            rv_q = rv_q.filter(MyntraPgReverse.settlement_date_prepaid_payment >= m_start, MyntraPgReverse.settlement_date_prepaid_payment < m_end)
         rv = rv_q.first()
 
         # Non-order
@@ -742,7 +742,7 @@ def commission_audit(
             MyntraPgForward.commission_percentage.isnot(None),
         )
         if m_start:
-            q = q.filter(MyntraPgForward.packing_date >= m_start, MyntraPgForward.packing_date < m_end)
+            q = q.filter(MyntraPgForward.settlement_date_prepaid_payment >= m_start, MyntraPgForward.settlement_date_prepaid_payment < m_end)
         q = q.order_by(MyntraPgForward.commission_percentage.desc())
 
         rows = q.all()
@@ -840,7 +840,7 @@ def sku_pnl(
             MyntraPgForward.workspace_id == ws_id
         )
         if m_start:
-            fw_q = fw_q.filter(MyntraPgForward.packing_date >= m_start, MyntraPgForward.packing_date < m_end)
+            fw_q = fw_q.filter(MyntraPgForward.settlement_date_prepaid_payment >= m_start, MyntraPgForward.settlement_date_prepaid_payment < m_end)
         fw_q = fw_q.group_by(
             MyntraPgForward.sku_code,
             MyntraPgForward.brand,
@@ -860,7 +860,7 @@ def sku_pnl(
             MyntraPgReverse.workspace_id == ws_id
         )
         if m_start:
-            rv_q = rv_q.filter(MyntraPgReverse.packing_date >= m_start, MyntraPgReverse.packing_date < m_end)
+            rv_q = rv_q.filter(MyntraPgReverse.settlement_date_prepaid_payment >= m_start, MyntraPgReverse.settlement_date_prepaid_payment < m_end)
         rv_q = rv_q.group_by(MyntraPgReverse.sku_code).all()
 
         for rv in rv_q:
