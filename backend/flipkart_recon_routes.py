@@ -607,3 +607,30 @@ def fk_sku_pnl_download(
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=flipkart_sku_pnl_{workspace_slug}.csv"},
     )
+
+
+# ---------------------------------------------------------------------------
+# DELETE: Clear all Flipkart recon data
+# ---------------------------------------------------------------------------
+
+@router.delete("/clear-all")
+def clear_fk_recon(workspace_slug: str = Query("default")):
+    """Delete ALL Flipkart reconciliation data for a workspace."""
+    db = SessionLocal()
+    try:
+        ws_id = resolve_workspace_id(db, workspace_slug)
+        counts = {}
+        for model, name in [
+            (FlipkartSkuPnl, "sku_pnl"),
+            (FlipkartOrderPnl, "order_pnl"),
+            (FlipkartPaymentReport, "payment_report"),
+        ]:
+            c = db.query(model).filter(model.workspace_id == ws_id).delete(synchronize_session=False)
+            counts[name] = c
+        db.commit()
+        return {"ok": True, "deleted": counts, "workspace_slug": workspace_slug}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Clear failed: {e}")
+    finally:
+        db.close()

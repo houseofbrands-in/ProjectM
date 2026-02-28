@@ -268,29 +268,70 @@ function OverviewTab({ fw, rv, no, summary }: any) {
 
 // ═══ Upload ═══
 function UploadTab({ workspaceSlug, onDone }: { workspaceSlug: string; onDone: () => void }) {
+  const [replaceMode, setReplaceMode] = useState(true);
+  const [deleting, setDeleting] = useState(false);
+
+  const handleDeleteAll = async () => {
+    if (!confirm("⚠️ This will delete ALL Myntra reconciliation data for this workspace. Are you sure?")) return;
+    setDeleting(true);
+    try {
+      const res = await fetch(`/api/db/recon/clear-all?workspace_slug=${workspaceSlug}`, { method: "DELETE" });
+      const data = await res.json();
+      if (res.ok) { toast.success("All Myntra recon data deleted"); onDone(); }
+      else toast.error(data?.detail || "Delete failed");
+    } catch (e: any) { toast.error(e.message); }
+    finally { setDeleting(false); }
+  };
+
+  const handleDeleteCosts = async () => {
+    if (!confirm("Delete all cost prices? This affects both Myntra & Flipkart True P&L.")) return;
+    try {
+      const res = await fetch(`/api/db/recon/cost-price/clear-all?workspace_slug=${workspaceSlug}`, { method: "DELETE" });
+      if (res.ok) { toast.success("Cost prices deleted"); onDone(); }
+    } catch (e: any) { toast.error(e.message); }
+  };
+
   return (
     <div className="space-y-4">
-      <div className="text-sm text-muted-foreground">Upload Myntra settlement reports for <Badge variant="outline">{workspaceSlug}</Badge></div>
+      <div className="flex items-center justify-between">
+        <div className="text-sm text-muted-foreground">Upload Myntra settlement reports for <Badge variant="outline">{workspaceSlug}</Badge></div>
+        <Button variant="destructive" size="sm" onClick={handleDeleteAll} disabled={deleting}>
+          {deleting ? "Deleting..." : "🗑 Delete All Data"}
+        </Button>
+      </div>
+
+      {/* Replace / Append toggle */}
+      <label className="flex items-center gap-2 text-sm cursor-pointer">
+        <input type="checkbox" checked={replaceMode} onChange={(e) => setReplaceMode(e.target.checked)} className="rounded" />
+        <span className="font-medium">Replace mode</span>
+        <span className="text-xs text-muted-foreground">{replaceMode ? "(replaces existing data on upload)" : "(appends to existing data)"}</span>
+      </label>
+
       <div className="grid md:grid-cols-2 gap-3">
         <UploadSlot label="PG Forward Settled" description="Forward sales that Myntra has settled"
-          onUpload={(f) => uploadReconPgForward(f, { workspace_slug: workspaceSlug, status: "settled" })} />
+          onUpload={(f) => uploadReconPgForward(f, { workspace_slug: workspaceSlug, status: "settled", replace: replaceMode })} />
         <UploadSlot label="PG Forward Unsettled" description="Forward sales pending settlement"
-          onUpload={(f) => uploadReconPgForward(f, { workspace_slug: workspaceSlug, status: "unsettled" })} />
+          onUpload={(f) => uploadReconPgForward(f, { workspace_slug: workspaceSlug, status: "unsettled", replace: replaceMode })} />
         <UploadSlot label="PG Reverse Settled" description="Returns/RTO that Myntra has settled"
-          onUpload={(f) => uploadReconPgReverse(f, { workspace_slug: workspaceSlug, status: "settled" })} />
+          onUpload={(f) => uploadReconPgReverse(f, { workspace_slug: workspaceSlug, status: "settled", replace: replaceMode })} />
         <UploadSlot label="PG Reverse Unsettled" description="Returns/RTO pending settlement"
-          onUpload={(f) => uploadReconPgReverse(f, { workspace_slug: workspaceSlug, status: "unsettled" })} />
+          onUpload={(f) => uploadReconPgReverse(f, { workspace_slug: workspaceSlug, status: "unsettled", replace: replaceMode })} />
         <UploadSlot label="Non-Order Settlement" description="Penalties, SPF claims, adjustments"
-          onUpload={(f) => uploadReconNonOrder(f, { workspace_slug: workspaceSlug })} />
+          onUpload={(f) => uploadReconNonOrder(f, { workspace_slug: workspaceSlug, replace: replaceMode })} />
         <UploadSlot label="Order Flow" description="Master order lifecycle"
-          onUpload={(f) => uploadReconOrderFlow(f, { workspace_slug: workspaceSlug })} />
+          onUpload={(f) => uploadReconOrderFlow(f, { workspace_slug: workspaceSlug, replace: replaceMode })} />
         <UploadSlot label="Listings Report (SKU Map)" description="Maps Myntra SKU codes to your seller SKU codes"
-          onUpload={(f) => uploadReconSkuMap(f, { workspace_slug: workspaceSlug })} />
+          onUpload={(f) => uploadReconSkuMap(f, { workspace_slug: workspaceSlug, replace: replaceMode })} />
       </div>
 
       {/* Cost Price Section */}
       <div className="pt-4 border-t">
-        <div className="text-sm font-medium mb-2">Cost Price (for True P&amp;L)</div>
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-sm font-medium">Cost Price (for True P&amp;L)</div>
+          <Button variant="outline" size="sm" className="text-red-600 border-red-200 hover:bg-red-50" onClick={handleDeleteCosts}>
+            🗑 Clear Costs
+          </Button>
+        </div>
         <div className="text-xs text-muted-foreground mb-3">Download template with your SKU codes pre-filled, add cost prices, upload back.</div>
         <div className="grid md:grid-cols-2 gap-3">
           <div className="rounded-xl border p-4">

@@ -41,7 +41,7 @@ def download_cost_template(
         if platform in ("myntra", "all"):
             try:
                 from backend.reconciliation_models import MyntraPgForward, MyntraSkuMap
-                # First try mapped seller SKUs
+                # Only include mapped seller SKUs (not raw Myntra codes)
                 mapped = db.query(
                     MyntraSkuMap.seller_sku_code,
                     MyntraSkuMap.sku_code,
@@ -54,20 +54,6 @@ def download_cost_template(
 
                 for m in mapped:
                     skus.add((m.seller_sku_code, m.style_name or "", m.brand or "", "myntra"))
-
-                # Also get unmapped Myntra SKUs
-                myntra_skus = db.query(
-                    MyntraPgForward.sku_code,
-                    MyntraPgForward.brand,
-                    MyntraPgForward.article_type,
-                ).filter(
-                    MyntraPgForward.workspace_id == ws_id
-                ).distinct().all()
-
-                mapped_codes = {m.sku_code for m in mapped}
-                for ms in myntra_skus:
-                    if ms.sku_code not in mapped_codes:
-                        skus.add((ms.sku_code, ms.article_type or "", ms.brand or "", "myntra"))
             except ImportError:
                 pass
 
@@ -330,7 +316,9 @@ def true_pnl(
 
                 for fw in fw_q:
                     rv = rv_map.get(fw.sku_code, {})
-                    seller_sku = sku_map.get(fw.sku_code, fw.sku_code)
+                    seller_sku = sku_map.get(fw.sku_code)
+                    if not seller_sku:
+                        continue  # Skip unmapped Myntra SKUs — no way to match cost price
                     rv_orders = rv.get("rv_orders", 0)
 
                     gross_revenue = fw.fw_revenue
@@ -425,3 +413,23 @@ def true_pnl_download(
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=true_pnl_{workspace_slug}.csv"},
     )
+
+
+# ---------------------------------------------------------------------------
+# DELETE: Clear all cost prices
+# ---------------------------------------------------------------------------
+
+@router.delete("/clear-all")
+def clear_cost_prices(workspace_slug: str = Query("default")):
+    """Delete ALL cost prices for a workspace."""
+    db = SessionLocal()
+    try:
+        ws_id = resolve_workspace_id(db, workspace_slug)
+        c = db.query(SkuCostPrice).filter(SkuCostPrice.workspace_id == ws_id).delete(synchronize_session=False)
+        db.commit()
+        return {"ok": True, "deleted": c, "workspace_slug": workspace_slug}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Clear failed: {e}")
+    finally:
+        db.close()

@@ -1136,3 +1136,32 @@ def sku_pnl_download(
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=sku_pnl_{workspace_slug}.csv"},
     )
+
+
+# ---------------------------------------------------------------------------
+# DELETE: Clear all Myntra recon data
+# ---------------------------------------------------------------------------
+
+@router.delete("/clear-all")
+def clear_myntra_recon(workspace_slug: str = Query("default")):
+    """Delete ALL Myntra reconciliation data for a workspace."""
+    db = SessionLocal()
+    try:
+        ws_id = resolve_workspace_id(db, workspace_slug)
+        counts = {}
+        for model, name in [
+            (MyntraPgForward, "pg_forward"),
+            (MyntraPgReverse, "pg_reverse"),
+            (MyntraNonOrderSettlement, "non_order"),
+            (MyntraOrderFlow, "order_flow"),
+            (MyntraSkuMap, "sku_map"),
+        ]:
+            c = db.query(model).filter(model.workspace_id == ws_id).delete(synchronize_session=False)
+            counts[name] = c
+        db.commit()
+        return {"ok": True, "deleted": counts, "workspace_slug": workspace_slug}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Clear failed: {e}")
+    finally:
+        db.close()
