@@ -59,7 +59,9 @@ export default function RootLayout({
             <Link className="rounded-xl px-3 py-2 hover:bg-muted" href="/reconciliation">
               Reconciliation
             </Link>
-
+            <Link className="rounded-xl px-3 py-2 hover:bg-muted" href="/flipkart-recon">
+              FK Recon
+            </Link>
 
           </nav>
         </div>

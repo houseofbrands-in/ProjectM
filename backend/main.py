@@ -40,6 +40,7 @@ from backend.models import CatalogRaw, ReturnsRaw, SalesRaw, Workspace, MyntraWe
 
 # ensure tables exist (simple dev-mode migration)
 from backend.reconciliation_models import MyntraPgForward, MyntraPgReverse, MyntraNonOrderSettlement, MyntraOrderFlow, MyntraSkuMap
+from backend.flipkart_recon_models import FlipkartSkuPnl, FlipkartOrderPnl, FlipkartPaymentReport
 Base.metadata.create_all(bind=engine)
 
 from datetime import datetime, timedelta
@@ -62,10 +63,12 @@ from sqlalchemy import cast
 from sqlalchemy.dialects.postgresql import JSONB
 
 from backend.reconciliation_routes import router as recon_router
+from backend.flipkart_recon_routes import router as fk_recon_router
 
 app = FastAPI(title="Project M API")
 
 app.include_router(recon_router)
+app.include_router(fk_recon_router)
 
 app.add_middleware(
     CORSMiddleware,

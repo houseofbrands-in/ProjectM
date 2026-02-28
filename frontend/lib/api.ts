@@ -1419,4 +1419,46 @@ export async function getReconPenaltyAudit(params: { workspace_slug?: string }) 
   return apiGet<any>("/db/recon/penalty-audit", params);
 }
 
+// =====================
+// Flipkart Reconciliation API Functions
+// =====================
+// Add these to the bottom of frontend/lib/api.ts
+
+export async function uploadFkSkuPnl(file: File, opts: { workspace_slug: string }) {
+  const form = new FormData();
+  form.append("file", file);
+  const qs = new URLSearchParams({ workspace_slug: opts.workspace_slug });
+  const res = await fetch(`/api/db/recon/flipkart/ingest/sku-pnl?${qs}`, { method: "POST", body: form });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.detail || "FK SKU PNL upload failed");
+  return data;
+}
+
+export async function uploadFkOrderPnl(file: File, opts: { workspace_slug: string }) {
+  const form = new FormData();
+  form.append("file", file);
+  const qs = new URLSearchParams({ workspace_slug: opts.workspace_slug });
+  const res = await fetch(`/api/db/recon/flipkart/ingest/order-pnl?${qs}`, { method: "POST", body: form });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.detail || "FK Order PNL upload failed");
+  return data;
+}
+
+export async function uploadFkPaymentReport(file: File, opts: { workspace_slug: string }) {
+  const form = new FormData();
+  form.append("file", file);
+  const qs = new URLSearchParams({ workspace_slug: opts.workspace_slug });
+  const res = await fetch(`/api/db/recon/flipkart/ingest/payment-report?${qs}`, { method: "POST", body: form });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.detail || "FK Payment report upload failed");
+  return data;
+}
+
+export async function getFkReconSummary(params: { workspace_slug?: string }) {
+  return apiGet<any>("/db/recon/flipkart/summary", params);
+}
+
+export async function getFkSkuPnl(params: { workspace_slug?: string; top_n?: number }) {
+  return apiGet<any>("/db/recon/flipkart/sku-pnl", params);
+}
 
