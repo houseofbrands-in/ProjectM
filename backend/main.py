@@ -60,7 +60,12 @@ from fastapi import UploadFile, File, Query
 from sqlalchemy import cast
 from sqlalchemy.dialects.postgresql import JSONB
 
+from backend.reconciliation_models import MyntraPgForward, MyntraPgReverse, MyntraNonOrderSettlement, MyntraOrderFlow
+from backend.reconciliation_routes import router as recon_router
+
 app = FastAPI(title="Project M API")
+
+app.include_router(recon_router)
 
 app.add_middleware(
     CORSMiddleware,
