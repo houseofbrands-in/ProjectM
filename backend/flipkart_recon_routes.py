@@ -222,7 +222,7 @@ def ingest_fk_order_pnl(
             "net_earnings", "earnings_per_unit", "net_margins_pct", "_net_margins2",
             "_bank_settlement2", "amount_settled", "amount_pending",
         ]
-        df.columns = col_names[:len(df.columns)]
+        df.columns = col_names[:len(df.columns)] if len(col_names) >= len(df.columns) else (col_names + [f"_x{i}" for i in range(len(df.columns) - len(col_names))])
         df = df.dropna(subset=["order_id"])
 
         if replace:
@@ -341,7 +341,10 @@ def ingest_fk_payment_report(
             "quantity", "product_sub_category", "additional_info",
             "return_type", "shopsy_order", "item_return_status",
         ]
-        df.columns = col_names[:len(df.columns)]
+        if len(col_names) >= len(df.columns):
+           df.columns = col_names[:len(df.columns)]
+        else:
+            df.columns = col_names + [f"_extra_{i}" for i in range(len(df.columns) - len(col_names))]
         df = df.dropna(subset=["order_id"])
 
         if replace:
