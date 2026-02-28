@@ -826,7 +826,7 @@ def sku_pnl(
             total_deductions = fw_commission + fw_logistics + tcs + tds
 
             # Net Profit = Revenue - Deductions + Return adjustments
-            net_profit = gross_revenue - total_deductions + rv_amount
+            net_profit = gross_revenue - total_deductions - abs(rv_amount)
             total_settled = fw.fw_settled + rv.get("rv_settled", 0)
 
             mapped = sku_map.get(fw.sku_code, {})
@@ -844,8 +844,8 @@ def sku_pnl(
                 "mrp_total": round(fw.fw_mrp, 2),
                 "discount_total": round(abs(fw.fw_discount), 2),
                 "gross_revenue": round(gross_revenue, 2),
-                "return_deduction": round(rv_amount, 2),
-                "net_revenue": round(gross_revenue + rv_amount, 2),
+                "return_deduction": round(-abs(rv_amount), 2),
+                "net_revenue": round(gross_revenue - abs(rv_amount), 2),
                 "commission": round(fw_commission, 2),
                 "logistics": round(fw_logistics, 2),
                 "tcs": round(tcs, 2),
