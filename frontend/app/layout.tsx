@@ -56,6 +56,9 @@ export default function RootLayout({
             <Link className="rounded-xl px-3 py-2 hover:bg-muted" href="/asp-optimizer">
               ASP Optimizer
             </Link>
+            <Link className="rounded-xl px-3 py-2 hover:bg-muted" href="/reconciliation">
+              Reconciliation
+            </Link>
 
 
           </nav>

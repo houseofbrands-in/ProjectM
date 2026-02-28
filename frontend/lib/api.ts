@@ -1308,6 +1308,122 @@ export async function getAdsRecommendations(args: {
   });
 }
 
+// =====================
+// Reconciliation API Functions
+// =====================
+// Add these to the bottom of frontend/lib/api.ts
+
+// --- Ingestion ---
+
+export async function uploadReconPgForward(
+  file: File,
+  opts: { workspace_slug: string; status: "settled" | "unsettled"; replace?: boolean }
+) {
+  const form = new FormData();
+  form.append("file", file);
+  const qs = new URLSearchParams({
+    workspace_slug: opts.workspace_slug,
+    status: opts.status,
+    replace: String(opts.replace ?? true),
+  });
+  const res = await fetch(`/api/db/recon/ingest/myntra/pg-forward?${qs}`, {
+    method: "POST",
+    body: form,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.detail || "PG Forward upload failed");
+  return data;
+}
+
+export async function uploadReconPgReverse(
+  file: File,
+  opts: { workspace_slug: string; status: "settled" | "unsettled"; replace?: boolean }
+) {
+  const form = new FormData();
+  form.append("file", file);
+  const qs = new URLSearchParams({
+    workspace_slug: opts.workspace_slug,
+    status: opts.status,
+    replace: String(opts.replace ?? true),
+  });
+  const res = await fetch(`/api/db/recon/ingest/myntra/pg-reverse?${qs}`, {
+    method: "POST",
+    body: form,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.detail || "PG Reverse upload failed");
+  return data;
+}
+
+export async function uploadReconNonOrder(
+  file: File,
+  opts: { workspace_slug: string; replace?: boolean }
+) {
+  const form = new FormData();
+  form.append("file", file);
+  const qs = new URLSearchParams({
+    workspace_slug: opts.workspace_slug,
+    replace: String(opts.replace ?? true),
+  });
+  const res = await fetch(`/api/db/recon/ingest/myntra/non-order-settlement?${qs}`, {
+    method: "POST",
+    body: form,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.detail || "Non-order upload failed");
+  return data;
+}
+
+export async function uploadReconOrderFlow(
+  file: File,
+  opts: { workspace_slug: string; replace?: boolean }
+) {
+  const form = new FormData();
+  form.append("file", file);
+  const qs = new URLSearchParams({
+    workspace_slug: opts.workspace_slug,
+    replace: String(opts.replace ?? true),
+  });
+  const res = await fetch(`/api/db/recon/ingest/myntra/order-flow?${qs}`, {
+    method: "POST",
+    body: form,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.detail || "Order flow upload failed");
+  return data;
+}
+
+// --- Analytics ---
+
+export async function getReconSummary(params: { workspace_slug?: string }) {
+  return apiGet<any>("/db/recon/summary", params);
+}
+
+export async function getReconCommissionAudit(params: {
+  workspace_slug?: string;
+  expected_rate?: number;
+}) {
+  return apiGet<any>("/db/recon/commission-audit", params);
+}
+
+export async function getReconSkuPnl(params: {
+  workspace_slug?: string;
+  top_n?: number;
+}) {
+  return apiGet<any>("/db/recon/sku-pnl", params);
+}
+
+export async function getReconSettlementTracker(params: {
+  workspace_slug?: string;
+}) {
+  return apiGet<any>("/db/recon/settlement-tracker", params);
+}
+
+export async function getReconPenaltyAudit(params: {
+  workspace_slug?: string;
+}) {
+  return apiGet<any>("/db/recon/penalty-audit", params);
+}
 
 
 
